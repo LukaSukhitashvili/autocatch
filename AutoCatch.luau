@@ -1,38 +1,13 @@
--- AutoCatch v4 — predicted-hit only, range independent.
+-- AutoCatch - auto catch, dodge, sidestep and auto-throw for Prison Dodgeball.
 --
--- v3 pressed continuously while *any* enemy ball was in flight. Two consequences:
---   * every ball the player merely brushed got converted into a catch, because a
---     press runs ThrowFX's late-catch scan over every ball currently bouncing off
---     the player, and that scan has no notion of "aimed at me";
---   * presses fired when nothing was inbound, which is noise, not catching.
---
--- v4 presses only while the game's own predictor says a ball will intersect the
--- player's capsule within CONFIG.pressLead seconds. That is the exact predictor
--- behind IncomingWarning (same candidate filter, same segment stepping, same
--- capsule test, same radius), so the script and the on-screen arrow agree.
---
--- Timing rule, taken from ThrowFX.catching():
---   contactTime - pressTime must land in [-0.03, +0.36]
--- so the press must exist before contact, not after it. v4 therefore opens the
--- press 0.30 s out and refreshes every 20 ms until the ball resolves, which keeps
--- the newest press inside the window no matter which frame contact lands on. The
--- timestamp is biased 20 ms into the past to survive a press that fires a frame
--- after the server already resolved the hit.
---
--- The press is the game's own path, not a forgery:
---   CatchPressT attribute -> Action:FireServer("Catch", serverTime) -> ThrowFX.MarkAction
---
--- Handout rule, v6: a sidelined player returns to the field by taking a ball from
--- a teammate and hitting someone with it. ThrowFX marks those throws kind="pass",
--- and they are aimed at the player's own feet, so any dodge, juke or turn moves
--- him off the ball he needs. While eliminated, pass-kind balls are dropped from
--- the threat set before the predictor sees them. Enemy attacks still register.
+-- Presses only while the game's own predictor says a ball will intersect the player's
+-- capsule within CONFIG.pressLead. Timing comes from ThrowFX.catching(), which accepts a
+-- press whose age at contact is inside [-0.03, +0.36], so the schedule opens early and
+-- refreshes; the stamp is biased 20 ms into the past to survive a late frame.
 
--- Reload guard. A reload is a fresh execution of this file, so without this the
--- previous instance keeps its own connections, its own press schedule and its own
--- dash alive beside the new one, and every measurement afterwards is the sum of
--- two assistants. The previous run publishes `unload`; call it first, so loading
--- this file is always exactly one instance no matter how many times it is run.
+-- Reload guard. A reload is a fresh execution of this file, so the previous instance's
+-- connections, press schedule and dash would run beside the new one. The run publishes
+-- `unload`; it is called first so loading is always exactly one instance.
 do
 	local previous = getgenv and getgenv().__autocatch
 	if type(previous) == "table" and type(previous.unload) == "function" then
@@ -56,35 +31,24 @@ local GameConfig = require(DodgeGame:WaitForChild("GameConfig"))
 local TargetPoint = require(DodgeGame:WaitForChild("TargetPoint"))
 local DodgeAnims = require(DodgeGame:WaitForChild("DodgeAnims"))
 local Action = DodgeGame:WaitForChild("Remotes"):WaitForChild("Action")
--- Catch answers arrive on FX, not Action: CatchRefused is broadcast as a Stance
--- event beside the throw and dodge effects, and it is the only word on whether a
--- press could count.
+-- Catch answers arrive on FX: CatchRefused is broadcast as a Stance event.
 local FX = DodgeFX:WaitForChild("Remotes"):WaitForChild("FX")
 local DodgeMatch = ReplicatedStorage:WaitForChild("DodgeMatch")
 
 local CONFIG = {
 	toggleKey = Enum.KeyCode.RightShift,
 
-	-- Where the press schedule opens. The judge accepts a stamp whose age at
-	-- contact is at most CATCH_WINDOW, so the schedule is defined by that window
-	-- rather than by a press count: a stamp older than the window at contact can
-	-- never catch, whatever the ball does, and a stamp inside it catches whenever
-	-- the prediction holds. Re-pressing is free - a refused press is answered on
-	-- CatchNote but does not arm CatchReadyAt (measured: the attribute does not
-	-- move), which is why the old one-press budget was leaving the last third of a
-	-- second with nothing to send and nothing to fall back to.
+	-- Where the press schedule opens. A stamp older than CATCH_WINDOW at contact can never
+	-- catch, and a refused press does not arm CatchReadyAt, so re-pressing is free.
 	pressLead = 0.220,
 
-	-- Ceiling on the refresh cadence. The live cadence is derived from the judge
-	-- window in the decision loop; this only caps it for a window that reads long.
+	-- Ceiling on the refresh cadence; the live cadence derives from the judge window.
 	pressInterval = 0.600,
 
-	-- Timestamp skew. The stamp is sent as now - bias, so a frame that fires just
-	-- after contact still reads as a press made before it.
+	-- Timestamp skew: sent as now - bias, so a press a frame after contact still reads early.
 	pressBias = 0.012,
 
-	-- Keep pressing this long after the last clean prediction, so the local bounce
-	-- window is covered even if the predictor loses the ball at contact.
+	-- Keep pressing this long past the last prediction to cover the local bounce window.
 	tail = 0.12,
 
 	-- Detection horizon and radius, identical to IncomingWarning.
@@ -94,16 +58,13 @@ local CONFIG = {
 	faceHorizon = 1.20,
 	faceHold = 0.35,
 
-	-- Safety net for the predictor: a ball this close and closing is going to
-	-- touch the capsule regardless of how the extrapolation reads.
+	-- Point-blank net: a ball this close and closing touches regardless of the extrapolation.
 	pointBlank = 4.0,
 
 	autoFace = true,
 	showLabel = true,
 
-	-- ThrowFX.catching() returns false, "has a ball" while the player is holding
-	-- one, so a second inbound ball cannot be caught until the held ball leaves the
-	-- hand. When a hit is predicted and the hands are full, throw it.
+	-- ThrowFX.catching() answers "has a ball" while one is held, so a predicted hit throws it.
 	autoThrow = true,
 	throwCooldown = 0.38,
 	throwRange = 170,
@@ -112,91 +73,52 @@ local CONFIG = {
 	-- Perfect throw: solve the intercept the way the game's own hit test reads it.
 	perfectThrow = true,
 
-	-- Silent aim. Rewrites the aim point on the game's own Throw remote so the
-	-- shot lands on the solved intercept no matter where the mouse is pointing.
-	-- The camera is never touched: manual aim stays exactly where the player put it.
+	-- Silent aim: rewrites the aim point on the game's own Throw remote. Camera untouched.
 	silentAim = true,
 
-	-- Also stamp the resolved enemy into the throw payload, so the server
-	-- associates the hit with the model the ball was aimed at.
+	-- Also stamp the resolved enemy into the throw payload.
 	silentTarget = true,
 
-	-- Keep LocalPlayer.LockOnTarget pointed at the current target. DodgeInput's
-	-- own chooseAim falls back to it for a mouse throw that hits nothing, which
-	-- keeps the character's turn and the local FX prediction in sync with the
+	-- Keep LockOnTarget on the current target so DodgeInput's own chooseAim agrees with the
 	-- rewritten aim.
 	lockOnTarget = true,
 
-	-- Camera lock. Off by default: silent aim does the redirect without touching
-	-- the view. Left in for anyone who wants the old hold-to-lock behaviour.
+	-- Camera lock, off by default - silent aim does not need the view.
 	autoAim = false,
 	aimButton = Enum.UserInputType.MouseButton2,
 	aimRange = 200,
 
-	-- Re-entry throw. An eliminated player picks a ball up off the floor and
-	-- throws it at a live enemy to get back on the field. That throw is a shot at
-	-- a specific opponent from a standing start with the whole arena watching, and
-	-- firing it the instant the ball is grabbed lands nowhere: the pickup has no
-	-- wind-up, the aim has not settled, and the receiver is whoever happened to be
-	-- nearest on that frame.
-	--
-	-- So it is the player's throw. Auto-throw stays on for normal in-round play;
-	-- this switch governs only the sidelined pickup, and it is off by default.
-	-- Silent aim and the aim-lock still apply to the manual throw, because they
-	-- live on the game's own Throw remote rather than on this path.
+	-- Re-entry throw. While eliminated the pickup throw is the player's - no wind-up, no
+	-- settled aim - so this switch is off by default and governs only that path.
 	autoReentry = false,
 
-	-- One decision pass per this many seconds, shared by both samplers. The old
-	-- loop ran the full predictor twice per frame; at 120 fps that is CPU the
-	-- network thread then has to compete with.
+	-- One decision pass per this many seconds, shared by both samplers.
 	tickInterval = 0.012,
 
-	-- Juke: when a hit is predicted and catching is impossible (holding, cooldown,
-	-- out of window) the hit test still leads the player by half its own flat
-	-- velocity across the view delay, so plain strafing gets caught. Reversing the
-	-- horizontal velocity flips that lead away from the body for a frame.
+	-- Juke: the hit test leads the body by half its flat velocity, so reversing it flips that
+	-- lead away from the capsule for a frame.
 	juke = true,
 	jukeCooldown = 0.40,
 	jukeSpeed = 26,
 
-	-- Dash. The server's own i-frames are the only thing that stops a ball the
-	-- 0.6 s catch cooldown has already made uncatchable. throwFX judges them as
-	-- [dodge - 0.03, dodge + 0.26], so contact has to land near the middle of that
-	-- 0.29 s span, not at its far edge. A 0.24 lead put contact 0.02 s before the
-	-- window closed, and every prediction that ran even slightly long ate the hit:
-	-- that is what a close-range hit looks like, contact at tti ~= -0.05 with the
-	-- dash already spent. At 0.15 the window has 0.14 s of slack on either side,
-	-- and 9.6 studs of lateral displacement still clears HIT_RADIUS (1.3).
+	-- Dash lead. throwFX judges i-frames as [dodge - 0.03, dodge + 0.26]: at 0.24 contact
+	-- landed 0.02 s before the window closed and ate the hit; at 0.15 there is 0.14 s of
+	-- slack either side and 9.6 studs of travel still clears HIT_RADIUS.
 	autoDodge = true,
 	dodgeLead = 0.150,
 
-	-- Sidestep. When the dash is inside its 2.2 s cooldown there is no cooldown
-	-- left to spend, so the body keeps walking out of the ball's line instead of
-	-- standing in it. Scoped to a live prediction and released immediately after.
+	-- Sidestep: with the dash on cooldown the body keeps walking out of the ball's line.
 	sidestep = true,
 	sideLead = 0.360,
 	jukeLead = 0.120,
 }
 
--- Numeric configuration ---------------------------------------------------------
+-- Numeric configuration. Every key feeds geometry, so a non-number is not a preference -
+-- the comparison throws in a hot path and the tick reads like a ball that was never seen.
 --
--- Every key listed here feeds geometry: a comparison, a horizon, a lead. A
--- non-number in that position is not a preference, it is a fault - the comparison
--- throws inside a hot path and the tick loses its answer, which reads exactly like
--- a ball that was never seen.
---
--- This is not hypothetical. The UI library's Round() does:
---
---     z = tostring(z)
---     return z:find(".") and tonumber(...) or z
---
--- so a value with no decimal point comes back as the STRING it was given, and
--- Slider:SetValue runs its changed callback during window creation. A slider whose
--- default is an integer therefore hands this table "1" before the user has touched
--- anything, and the physical body answer dies with a type error on every tick
--- while the catch and dash paths keep working. The string is invisible in a
--- counter and obvious in a type check, so: coerce on write, re-assert on load, and
--- a selftest row that fails if one ever gets through.
+-- The UI library's Round() returns a string for any value without a decimal point, and
+-- Slider:SetValue runs its callback at window creation, so a slider hands this table "1"
+-- before the user touches it. Hence: coerce on write, re-assert on load, selftest row.
 local NUMERIC_CONFIG = {
 	"pressLead",
 	"pressInterval",
@@ -233,8 +155,7 @@ local function normalizeConfig()
 	return repaired
 end
 
--- The write boundary. A slider hands back whatever the library decided the value
--- is; the table is ours and it only ever holds a number.
+-- The write boundary: the table only ever holds a number.
 local function setNumber(key, value)
 	local number = tonumber(value)
 	if number then
@@ -246,37 +167,22 @@ local OUT_ATTR = Shared.ATTR.Out
 local CATCH_ANGLE_COS = math.cos(math.rad(GameConfig.CATCH_ANGLE or 120))
 local CATCH_RADIUS = GameConfig.BALL_RADIUS + GameConfig.HIT_RADIUS
 
--- The body lane deliberately reaches further than the catch lane. `CATCH_RADIUS`
--- is what the catch judge uses to decide a ball is catchable; it is not what the
--- hit judge uses, and the difference is not observable from the payload.
--- Measured: `Ball_m158` read a constant `miss=2.64` then `3.00` on its approach,
--- closed to 3.2 studs with `tca=0.007`, and took the life anyway - a predicted
--- clearance of 0.6 studs on a ball the server scored as a hit. The body does not
--- get to be wrong in that direction: dashing a ball that would have passed costs
--- a dash, missing one that arrives costs a life.
+-- The body lane reaches further than the catch lane. CATCH_RADIUS is what the catch judge
+-- uses; the hit judge scores at ~3.0. Measured: miss=2.64-3.00 closing to 3.2 studs with
+-- tca=0.007 took the life. Dashing a passing ball costs a dash; missing one costs a life.
 local BODY_HEADROOM = 0.6
 local BODY_RADIUS = CATCH_RADIUS + BODY_HEADROOM
 local STEP = 0.022222222222222223
 
--- Dodge sizing. `DODGE_MARGIN` is what the body has to add to the tracker's own
--- predicted miss before the hit test is out of reach: one stud for the frames
--- spent accelerating to dash speed and a little for the draw lag on the ball.
--- `DODGE_MIN_TRAVEL` keeps a dash that only needed a nudge from reading as a
--- stutter; `DODGE_MAX_LIFE` is the ceiling that keeps a dash against a wall from
--- running until the next round.
+-- Dodge sizing. DODGE_MARGIN covers acceleration and the ball's draw lag; MIN_TRAVEL keeps
+-- a nudge from reading as a stutter; MAX_LIFE stops a dash against a wall running forever.
 local DODGE_MARGIN = 0.6
 local DODGE_MIN_TRAVEL = 1.2
 local DODGE_MAX_LIFE = 0.30
 
--- How far the body has to travel along `off` to clear the ball, given that the
--- dash replaces the body's own velocity along that axis for as long as it runs.
--- `miss` is the offset the tracker predicts if nothing changes, and it already
--- includes the body's drift; what it does not include is the fact that the dash
--- takes that drift away. A body already sliding away from the line gains only
--- (dash speed - drift) per second of dash, so it owes more distance than the raw
--- gap; a body drifting into the line owes less, because the dash stops the loss
--- as well as adding to the offset. Without this a dash fired while strafing
--- lands exactly where the gap said it should and still ends up short.
+-- Distance the body owes along `off`. The dash replaces the body's own velocity on that
+-- axis, so a body sliding away gains only (dash speed - drift) and owes more; one drifting
+-- into the line owes less.
 local function dashOwed(miss, off, rootVel, speed)
 	local clear = BODY_RADIUS + DODGE_MARGIN
 	if type(miss) ~= "number" or miss < 0 then
@@ -291,25 +197,14 @@ local function dashOwed(miss, off, rootVel, speed)
 	return owed
 end
 
--- Escape side ---------------------------------------------------------------
---
--- The side a dash or step picks is a bet on open floor, and nothing checked it.
--- Measured live: eight directions probed from one standing spot, seven carried
--- the body 10.4-10.6 studs and one carried it 0.10. A dash aimed at that one
--- spent its whole 0.30 s at 64 studs/s pressing into geometry and travelled
--- 0.007 studs, which reads to the player as "the dodge did nothing" while the
--- 2.2 s cooldown burns. The subset of the body line the step is leaving is worth
--- less than the floor it has to cross to leave it, so a blocked side loses to an
--- open one in the opposite direction.
+-- Escape side. Measured: eight directions from one spot, seven carried the body 10.4-10.6
+-- studs and one carried it 0.10 - a full 0.30 s dash travelled 0.007 while the 2.2 s
+-- cooldown burned. A blocked side loses to an open one in the opposite direction.
 local FUNCTION_CLEAR_RADIUS = 1.6
 
--- Thin rays, not a fat shape. Every shape-cast flavour failed on the one case
--- that matters: a body already flush with geometry. A Spherecast that starts
--- overlapping reports no hit at all, and an overlap sphere wide enough to read
--- the wall ahead also reaches back across the body and reports the opposite
--- direction blocked, so a pinned body saw both sides closed and stayed put.
--- A ray from the root centre starts outside any wall the capsule can touch, so
--- it reports exactly the run of floor in the direction asked about.
+-- Thin rays, not shape casts. A Spherecast starting flush with geometry reports no hit,
+-- and one wide enough to see the wall ahead also reports the opposite side blocked, so a
+-- pinned body saw both sides closed. A ray from the root centre reports the floor asked for.
 local function clearRun(character, root, unit, dist)
 	local params = RaycastParams.new()
 	params.FilterType = Enum.RaycastFilterType.Exclude
@@ -340,9 +235,8 @@ local function clearRun(character, root, unit, dist)
 	return math.max(0, best - 0.05)
 end
 
--- Returns the direction to travel and the clearance along it. The preferred side
--- is kept unless it is blocked and the other side is meaningfully more open,
--- so an ordinary dash is unchanged and a wall-pinned one flips.
+-- Direction and clearance. The preferred side holds unless it is blocked and the other is
+-- meaningfully more open.
 local function freeSide(character, root, unit, dist)
 	local want = math.max(dist, DODGE_MIN_TRAVEL)
 	local ahead = clearRun(character, root, unit, want)
@@ -356,9 +250,7 @@ local function freeSide(character, root, unit, dist)
 	return unit, ahead
 end
 
--- The catch window is per character: IncomingWarning reads CatchWin off the
--- character and falls back to GameConfig.CATCH_WINDOW. Reading the same source
--- keeps the press plan on the same clock as the green zone the game draws.
+-- Per-character catch window: the same source IncomingWarning reads.
 local function catchWindow(character)
 	local value = character and character:GetAttribute("CatchWin")
 	if type(value) == "number" and value > 0.02 and value < 1 then
@@ -368,9 +260,7 @@ local function catchWindow(character)
 	return GameConfig.CATCH_WINDOW or 0.36
 end
 
--- The server publishes the exact instant it will accept the next catch or dash.
--- Publishing a refusal back to the client is cheap; spending the 2.2 s dash
--- cooldown on one is not, so every gate reads the server's own number first.
+-- The server publishes the next accepted catch/dash instant, so every gate reads it first.
 local function readyAt(character, name)
 	local fromPlayer = LocalPlayer:GetAttribute(name)
 	if type(fromPlayer) == "number" then
@@ -440,39 +330,24 @@ local S = {
 	pathJukes = 0,
 	pathOpen = 0,
 	pathHeld = 0,
-	-- Per-rule tally for the physical body answer. Every tracked ball that is not
-	-- answered lands in exactly one bucket: skipped by the candidate filter, already
-	-- inside the reach radius, no usable sample yet, too slow, closest approach
-	-- already past, beyond the horizon, or clearing the radius. A zero body count
-	-- with a full bucket tells which rule is responsible instead of leaving it to
-	-- the shape of the deaths.
+	-- Per-rule tally. Every tracked ball lands in exactly one bucket, so a zero body count
+	-- names the rule responsible instead of leaving it to the shape of the deaths.
 	pathWhy = {},
-	-- The same tally, split by which source answered. `pathWhy` alone hides the
-	-- fact that the part source answers almost nothing; the segment source is the
-	-- one carrying every ball this game actually throws, so its own bucket says
-	-- whether the body answer is alive at all.
+	-- Same tally split by source. The segment source carries every ball this game throws, so
+	-- its bucket says whether the body answer is alive at all.
 	pathWhySeg = {},
-	-- Parts the tracker holds but that are not carrying motion (pooled seats).
-	-- Kept out of `pathWhy` so that tally keeps meaning "a ball was judged".
+	-- Parts held but not moving (pooled seats), kept out of pathWhy.
 	pathWhyPartIdle = 0,
 	contactAge = {},
-	-- What the tracker did with each ball part this round. `weld_far` is the one
-	-- to watch: a refusal there means a ball was flying while still carrying the
-	-- weld from its throw, which is the body answer going blind, not a carried
-	-- ball.
+	-- Tracker verdict per part. `weld_far` means a flying ball still carrying its throw weld.
 	pathDrop = {},
 	-- Close passes, newest last, with the raw geometry. A path count of zero over
 	-- a round can only be explained by looking at what the tracker actually saw
 	-- in the last metre, so this ring is the live witness.
 	pathClose = {},
-	-- Full flight recorder: every tracked ball within 20 studs of the body,
-	-- every tick, whatever the verdict. The close ring answers "how close did it
-	-- get"; this answers "what was known in the last second", which is the only
-	-- question that matters after a life drops.
+	-- Flight recorder: every tracked ball within 20 studs, every tick, whatever the verdict.
 	pathWide = {},
-	-- First sighting of every ball the lane could answer, with the distance it
-	-- was at. Separates "the ball was never visible" from "it was visible and
-	-- every answer was gated", which are different faults with the same symptom.
+	-- First sighting per ball with distance: separates never visible from always gated.
 	sightLog = {},
 	-- Every six-stud crossing with the press age and the judge band at that
 	-- instant. A press that exists but lands in `late` means the prediction, not
@@ -530,10 +405,7 @@ local S = {
 	traceHead = 1,
 	traceMax = 160,
 	pressCount = 0,
-	-- Dash flight records. A dash that spends its life and moves a centimetre
-	-- looks identical to one that never fired unless the per-frame facts are
-	-- kept, and the travel ring makes a run of dashes readable as a distribution
-	-- instead of a single last value.
+	-- Dash flight records, plus a travel ring so a run of dashes reads as a distribution.
 	dashLog = {},
 	dashLogN = 0,
 	dashTravels = {},
@@ -554,11 +426,8 @@ local S = {
 	lastTick = 0,
 	refusals = {},
 	kinds = {},
-	-- Per-class outcome tally. The complaint that started this work is a claim
-	-- about two populations - bot throws and player throws - behaving differently,
-	-- and no counter in the file could separate them. Every sighting, press, dash,
-	-- catch and lost life now lands in exactly one bucket keyed on the ball's own
-	-- `kind`, so the two populations can be compared instead of argued about.
+	-- Per-class tally keyed on the ball's own `kind`, so bot throws and player throws can be
+	-- compared instead of argued about.
 	classTally = {},
 	classLast = {},
 	reject = {},
@@ -568,10 +437,8 @@ local S = {
 	aimHeld = false,
 	aimTarget = nil,
 	lockTarget = nil,
-	-- Arrival race. One row per ball the instant the contact clock reaches zero:
-	-- which answer was live, and whether the server would have accepted it. A
-	-- death is resolved against this ring, so "dodged and still hit" becomes a
-	-- verdict instead of a shrug.
+	-- Arrival race: one row at contact, naming the answer that was live and whether the
+	-- server would have taken it.
 	race = {},
 	raceHead = 1,
 	raceMax = 24,
@@ -582,13 +449,10 @@ local S = {
 
 local bodyCache = setmetatable({}, { __mode = "k" })
 
--- Movement-edge tally. Every decision in this file is made without ever reading a
--- key: there is no gate on movement input anywhere in the catch, dash or sidestep
--- path. What movement changes is the body's velocity and who owns Humanoid:Move,
--- so the only way to answer "does holding a key weaken the assist" is to bucket
--- each decision by whether a movement key was held on that tick and compare the
--- rates per threat seen. `seen` is the denominator: a bucket with fewer presses
--- is only a fault if it also saw threats.
+-- Movement-edge tally. No decision reads a key; what movement changes is the body's
+-- velocity and who owns Humanoid:Move. Bucketing each decision by whether a key was held
+-- is the only way to answer "does holding a key weaken the assist". `seen` is the
+-- denominator - fewer presses only matter if the bucket also saw threats.
 S.heldInput = false
 S.edge = { free = {}, hold = {} }
 
@@ -597,13 +461,11 @@ local function edge(kind)
 	bucket[kind] = (bucket[kind] or 0) + 1
 end
 
--- The hit counter is a session-cumulative attribute, so a reload mid-round has to
--- seed from it or every later reading understates the damage taken.
+-- HitsTaken is session-cumulative, so a reload has to seed from it.
 S.hits = tonumber(LocalPlayer:GetAttribute("HitsTaken")) or 0
 
--- Port of IncomingWarning.timeToHit: same segment stepping, same steer handling,
--- same capsule test, same radius. rootVel is injectable so the self-test can pin
--- the player's velocity instead of reading it off the live assembly.
+-- Port of IncomingWarning.timeToHit: same stepping, steering, capsule test and radius.
+-- rootVel is injectable so the self-test can pin the body's velocity.
 local function timeToHit(state, character, rootPart, body, now, horizon, radius, rootVel)
 	local seg = state.seg
 	if not seg then
@@ -682,30 +544,14 @@ local function timeToHit(state, character, rootPart, body, now, horizon, radius,
 	return nil
 end
 
--- Handout filter --------------------------------------------------------------
---
--- A sidelined player gets back into the round by taking a ball from a teammate,
--- throwing it and hitting someone. The ball arrives as a *pass*, and it is aimed
--- at exactly where the player is standing. Every evasion path in this script
--- moves the body off that line, so treating a pass as a threat while eliminated
--- throws away the only route back onto the field.
---
--- While eliminated the only thing worth doing with an inbound ball is standing
--- still and letting it arrive, so passes are filtered out of the threat set
--- entirely. Enemy attacks still register (they cost nothing to dodge, and the
--- point-blank net must not be widened to cover passes).
+-- Handout filter. A sidelined player returns by taking a teammate's ball and hitting
+-- someone with it; that ball arrives as a `pass` aimed at the player's feet, so any dodge
+-- moves him off the only route back. Passes leave the threat set while eliminated; enemy
+-- attacks still register.
 
--- Throw classification -------------------------------------------------------
---
--- The two populations this file has to serve are keyed by the ball's own `kind`,
--- which ThrowFX derives from the thrower's identity: a character owned by a
--- Player is `attack`, one that is not is `bot`, and anything marked as a pass is
--- `pass`. That marker is the authoritative answer to "who threw this" and it is
--- already on every live entry, so classification is a read, not an inference.
---
--- Unknown values are kept as themselves rather than folded into a bucket: a new
--- class appearing in the game should show up in the tally by name, not be
--- silently counted against an existing population.
+-- Throw classification. `kind` is set by ThrowFX from the thrower's identity: a Player-
+-- owned character is `attack`, anything else `bot`, a marked handout `pass`. Unknown
+-- values keep their own name rather than being folded into an existing bucket.
 local function classOf(state)
 	if state == nil then
 		return "none"
@@ -723,10 +569,8 @@ local function classOf(state)
 	return "unknown"
 end
 
--- One row per class, created on first sighting. `seen` counts ticks on which
--- decide() picked this class as the ball it would answer, which is the only
--- measure of "the assist noticed it" that is comparable across classes: a raw
--- per-tick scan would just report how many balls exist.
+-- One row per class. `seen` counts ticks decide() picked this class, which is comparable
+-- across classes; a raw per-tick scan would just count balls.
 local function classRow(kind)
 	local row = S.classTally[kind]
 	if not row then
@@ -769,9 +613,7 @@ local function isEliminated()
 	return false
 end
 
--- ThrowFX.Predict takes `pass = false` for an attack, so any other value on a
--- live entry means the throw was a pass. `kind` is the live marker that actually
--- matters: every ball state carries kind = "attack" | "pass" | "bot".
+-- ThrowFX.Predict takes pass=false for an attack, so any other value means a pass.
 local function isHandout(state, character)
 	if state.kind == "pass" then
 		return true
@@ -789,10 +631,8 @@ local function isHandout(state, character)
 	return false
 end
 
--- While sidelined, a teammate's ball cannot cost anything and may be the ball
--- that gets him back in. Belt and braces on top of the kind check: a pass that
--- arrives mislabelled, or a teammate throw that is not a pass at all, is still
--- not worth moving for when there are no lives left to lose.
+-- Belt and braces on the kind check: a mislabelled pass, or a teammate throw that is not
+-- a pass, is still not worth moving for with no lives left to lose.
 local function isFriendThrow(state, myTeam)
 	local thrower = state.thrower
 	if not thrower or myTeam == nil then
@@ -806,11 +646,8 @@ local function isFriendThrow(state, myTeam)
 	return ok and team ~= nil and team == myTeam
 end
 
--- Exactly the filter IncomingWarning.candidate uses, minus the team gate. The
--- catch judge does not care who threw the ball, and eliminated players keep
--- throwing from the sideline, so a ball from a teammate or an outsider is still
--- a ball that will break a face. Anything predicted to touch the capsule is a
--- threat; anything that cannot touch it is not.
+-- IncomingWarning's candidate filter minus the team gate: anything predicted to touch the
+-- capsule is a threat, and the catch judge does not care who threw it.
 local function isCandidate(state, character, out, myTeam, requireCanHit, soft, lane)
 	local reject = S.reject
 	local function no(reason)
@@ -831,11 +668,8 @@ local function isCandidate(state, character, out, myTeam, requireCanHit, soft, l
 	if requireCanHit ~= false and not state.canHit then
 		return no("canhit")
 	end
-	-- `hold` means somebody is carrying this ball. The bounce flags mean it has
-	-- already come off the floor or a wall, which the catch judge refuses but the
-	-- hit test does not: a post-bounce ball still takes a life. The catch path has
-	-- to drop them, the body path has to keep seeing them, so `soft` relaxes the
-	-- bounce flags and nothing else.
+	-- `hold` means somebody is carrying it. The catch judge refuses bounced balls, the hit
+	-- test does not, so `soft` relaxes the bounce flags and nothing else.
 	if state.hold or (not soft and (state.bounce or state.worldBounced or state.floored)) then
 		return no("state")
 	end
@@ -851,9 +685,7 @@ local function isCandidate(state, character, out, myTeam, requireCanHit, soft, l
 	return true
 end
 
--- Live ball entries are rebuilt or replaced by ThrowFX, so the handout tally is
--- keyed weakly: a ball counted once is never counted twice, and the table does
--- not keep dead entries alive.
+-- Keyed weakly: a ball counted once is never counted twice, and dead entries are released.
 local handoutSeen = setmetatable({}, { __mode = "k" })
 
 local function tallyHandouts(live, character, myTeam)
@@ -881,9 +713,8 @@ local function travelDir(state, now)
 	return nil
 end
 
--- Direction the ball is coming from, usable even when the segment has no
--- velocity left to read. The cone check must never be fed a stale direction from
--- a different ball: a wrong angle rejects a catch the server would have taken.
+-- Approach direction, usable when the segment has no velocity left. A stale direction
+-- from another ball rejects a catch the server would have taken.
 local function approachDir(state, root, now)
 	local dir = travelDir(state, now)
 	if dir then
@@ -902,10 +733,8 @@ local function approachDir(state, root, now)
 	return nil
 end
 
--- Returns the nearest ball that is predicted to intersect the player, its
--- time-to-impact, its travel direction, and how many candidates were considered.
--- `out` is the eliminated state: while it is true, balls the game marks as passes
--- are handouts and are dropped before they can become a threat.
+-- Nearest predicted-intersecting ball, its tti, travel direction, and how many candidates
+-- were considered.
 local function decide(live, character, root, body, now, myTeam, rootVel, out)
 	if type(live) ~= "table" then
 		return nil, nil, nil, 0
@@ -941,11 +770,9 @@ local function decide(live, character, root, body, now, myTeam, rootVel, out)
 		return best, bestTti, bestDir, count
 	end
 
-	-- Safety net. The predictor steps 22 ms at a time and gives up after the
-	-- horizon, so a ball that arrives between two steps, or one whose steered
-	-- segment was rewritten by the thrower a frame ago, can reach the capsule
-	-- without ever producing a hit. At this distance the extrapolation is not
-	-- needed: a ball inside pointBlank that is still closing will touch. Press.
+	-- Point-blank net. The predictor steps 22 ms at a time and gives up after the horizon, so
+	-- an arrival between two steps reaches the capsule without a hit. Inside pointBlank the
+	-- extrapolation is not needed: closing means touching.
 	local rootPos = root.Position
 
 	for _, state in pairs(live) do
@@ -972,18 +799,12 @@ local function decide(live, character, root, body, now, myTeam, rootVel, out)
 	return best, bestTti, bestDir, count
 end
 
--- Raw closest-approach threat ------------------------------------------------
+-- Raw closest-approach threat. ThrowFX answers nothing for a pass or a stalled segment,
+-- and both still land - the server's hit test does not consult canHit. The last 0.35 s of
+-- flight is a straight line, so the ball's own motion answers it.
 --
--- ThrowFX answers nothing for a pass (canHit is false by construction) and for a
--- ball whose segment it has stopped advancing, and both still land: the server's
--- hit test does not consult canHit. Passes killed two lives in the 300 s run and
--- were invisible to every predictor above. On the last 0.35 s the flight is a
--- straight line, so the ball's own replicated motion is enough to answer whether
--- it is going to pass through the body and when.
---
--- This is no longer the body's authority - physicalThreat is - but it still says
--- "something is arriving" while the press schedule is live, and it still writes
--- the raw-contact audit row for a ball with no segment at all.
+-- No longer the body's authority, but it still reports an arrival while the press
+-- schedule is live and writes the audit row for a ball with no segment at all.
 local rawTrack = setmetatable({}, { __mode = "k" })
 
 local function rawThreat(live, character, root, now)
@@ -1027,64 +848,39 @@ local function rawThreat(live, character, root, now)
 	return bestTti, bestDir
 end
 
--- Physical ball path ----------------------------------------------------------
+-- Physical ball path. Live() is the game's judgement model, not the set of physical
+-- balls: a ball leaves it the instant it resolves, and a bounced one re-enters on a
+-- segment that still extrapolates the pre-bounce line - so a ricochet arrives with
+-- nothing predicting it.
 --
--- Every predictor above answers from ThrowFX.Live() or from a state in that map.
--- Live() is the game's own judgement model, not the set of physical balls: a
--- ball leaves it the instant it resolves, and a ball that has come off the world
--- re-enters with a segment that still extrapolates the pre-bounce line. A
--- ricochet therefore arrives with no segment predicting a hit and no velocity
--- history to derive one from, which is the point-blank hit that looks dodgeable
--- on screen: on the frame the ball appears, nothing in Live() says it is coming.
---
--- The part itself is always there. DodgeBalls holds one part per ball for the
--- whole round - parked, held, flying, bouncing, pooled - so tracking the part
--- instead of the state gives a path that survives every one of those
--- transitions.
---
--- Velocity comes from the position delta, never from AssemblyLinearVelocity. In
--- flight that field reports 64 studs/s while the ball is travelling 148, so it
--- is a false witness; the delta is the motion. A delta is discarded only when it
--- implies a re-placement rather than flight, which is what pooling to the
--- parking position looks like.
+-- The part is always there (DodgeBalls holds one per ball for the whole round), so the
+-- path is tracked on the part. Velocity comes from the position delta, never from
+-- AssemblyLinearVelocity: in flight that field reads 64 studs/s while the ball travels 148.
 local ballPath = setmetatable({}, { __mode = "k" })
 
--- Fastest a ball can be *observed* to move. The ball's own ceiling is the game's
--- throw speed; the observation adds a second factor, because a client frame can
--- carry two replication samples at once and the delta is then travelled over one
--- frame instead of two. A bound below that deletes real flight exactly when the
--- frame rate dips - which is the moment the answer matters. Re-placements are not
--- near this number: pooling moves a ball hundreds of studs inside one tick, two
--- orders of magnitude above the bound, so the two regimes stay separated without
--- any tuning in between.
+-- Fastest a ball can be observed to move. A client frame can carry two replication
+-- samples, so the observation is faster than the game's throw speed; re-placements run
+-- two orders of magnitude above this, so the regimes stay separated.
 local PATH_MAX_SPEED =
 	4 * math.max(GameConfig.PLAYER_THROW_SPEED or 140, GameConfig.THROW_SPEED or 125)
 
--- Fastest legal approach in the game. Used to price a ball that has no measured
--- trajectory yet, so the answer errs early rather than late.
+-- Fastest legal approach, used to price a ball with no measured trajectory yet.
 local PATH_THROW_SPEED =
 	math.max(GameConfig.PLAYER_THROW_SPEED or 140, GameConfig.THROW_SPEED or 125)
 
--- How close a ball must be for a trajectory-less arrival to be the body's
--- business at all. Beyond this the next sample will carry a velocity.
+-- How close a trajectory-less ball must be to be the body's business at all.
 local PATH_NEAR = 14
 
--- A ball that has just been re-placed is a fresh answer for this long. Past it,
--- a record without a trajectory is a ball the tracker stopped seeing, and
--- pricing that as an arrival would walk the body away from nothing forever.
+-- A re-placed record is a fresh answer for this long. Past it, a trajectory-less record
+-- is a ball the tracker lost.
 local PATH_ARRIVAL_AGE = 0.10
 
--- The palm, as a radius rather than an object. Used both by the display
--- reconciler below and by the tracker, which needs the same answer to "is this
--- ball at that hand" that the ghost check uses.
+-- The palm as a radius: shared by the display reconciler and the tracker.
 local PALM_RADIUS = 3.2
 local PALM_DY = 2.5
 
--- The part a weld ties this ball to, if any. The game welds a ball to the
--- thrower's RightHand and that weld is still parented when the ball is already
--- tens of studs away, so the object's existence is not the same question as "is
--- this ball being carried". The partner's position is the honest answer, and it
--- is returned here so the tracker can report the distance rather than guess.
+-- The part a weld ties this ball to. The weld outlives the carry by tens of studs, so the
+-- partner's position is the honest answer to "is this ball being carried".
 local function weldAnchor(part)
 	local weld = part:FindFirstChildWhichIsA("Weld")
 	if not weld then
@@ -1094,16 +890,10 @@ local function weldAnchor(part)
 	return other and other.Position or nil
 end
 
--- Whether a part can carry a ball's motion at all. Anchoring is deliberately not
--- consulted: the server moves every ball by CFrame and leaves the part anchored,
--- so `not part.Anchored` selects nothing and the tracker goes blind while balls
--- fly past it. Motion is the position delta; a re-placement is rejected by the
--- speed bound below, which is the only test that needs to know about teleports.
---
--- Returns the candidate answer plus the distance to the part it is welded to, so
--- a report can separate "held in a palm" from "carrying a weld that was never
--- cleaned up". A refusal that cannot be attributed is a refusal that silently
--- blinds the body answer.
+-- Whether a part can carry motion at all. Anchoring is not consulted: the server moves
+-- every ball by CFrame and leaves it anchored, so skipping anchored parts tracks nothing.
+-- Re-placements are rejected by the speed bound. Returns the weld distance so "held in a
+-- palm" and "carrying a stale weld" can be told apart.
 local function pathCandidate(part, exempt)
 	if not (part and part.Parent) then
 		return false, nil
@@ -1118,42 +908,24 @@ local function pathCandidate(part, exempt)
 	return true, nil
 end
 
--- A ball that has not moved this far between two ticks has not been re-sampled.
--- Replication delivers a ball's CFrame in hops (10-20 Hz), not at the tick rate,
--- so most ticks observe the same position. Advancing the sample clock on those
--- ticks is what made every hop look instantaneous - the delta was compared
--- against one tick of elapsed time and rejected as a teleport, forever.
+-- A ball that has not moved this far has not been re-sampled. Replication delivers CFrame
+-- in 10-20 Hz hops, so advancing the sample clock on unchanged ticks made every hop look
+-- instantaneous and rejected as a teleport.
 local PATH_EPS = 0.02
 
--- Longest gap that still counts as a flight sample. Anything older cannot claim
--- the ball travelled the distance in that time; it was somewhere else.
+-- Longest gap that still counts as a flight sample.
 local PATH_MAX_GAP = 0.25
 
--- How long a segment record may still be extrapolated after ThrowFX stops
--- reporting the ball. This is a different question from PATH_MAX_GAP: that one
--- asks whether a *sample* is a flight sample, this one asks whether a *ball*
--- is still in the air. A ball that bounces stops being reported (the bounce
--- sets canHit=false and clears the target) and then keeps flying - measured at
--- four live deaths, the ball that took the life was dropped 0.99-1.17 s before
--- it arrived. The old gate reused PATH_MAX_GAP and closed the lane at a quarter
--- of that, so every one of those balls was unreachable by construction.
---
--- The bound is not a guess about the flight, it is the horizon the body could
--- act inside. A record older than this predicts a ball already past the body
--- (the extrapolation is monotone), which pathThreat refuses on its own.
+-- How long a segment may still be extrapolated after ThrowFX stops reporting the ball.
+-- A bounced ball stops being reported and keeps flying: measured across four deaths, the
+-- killer was dropped 0.99-1.17 s before it arrived. This is the horizon the body could
+-- act inside, not a guess about the flight.
 local ORPHAN_MAX_AGE = 1.6
 
--- One tracker step. Pure: takes the record for a part and this tick's position,
--- returns the record to store and a verdict naming what the step decided. Every
--- sampling rule lives here rather than in the loop, because this is exactly where
--- the anchored/CFrame blindness lived and a rule that cannot be asserted is a
--- rule that silently stops holding. The verdict exists so a live round can say
--- which rule is consuming the balls, instead of showing a path count of zero.
---
--- `prev`/`dt` are only written when the ball genuinely moved, and `dt` is the
--- time between two *distinct* positions, so the speed bound compares like with
--- like: a hop of 7 studs over 0.05 s is 140 studs/s and passes; the same hop
--- over one 12 ms tick is 580 and is a re-placement.
+-- One tracker step, pure: record in, record out plus a verdict naming what the step did.
+-- `prev`/`dt` are written only when the ball genuinely moved, so the speed bound compares
+-- like with like - 7 studs over 0.05 s is 140 and passes; the same hop over one 12 ms
+-- tick is 580 and is a re-placement.
 local function pathSample(rec, pos, now)
 	if not rec then
 		return { pos = pos, t = now }, "first"
@@ -1194,12 +966,8 @@ local function trackBalls(now, live)
 		return
 	end
 
-	-- Draw lag per part. The replicated part is drawn `state.lag` seconds in the
-	-- past - ThrowFX.keep() evaluates the path at (a2 - lag) - while `state.seg`
-	-- is evaluated at now. That difference is real flight the tracker has not
-	-- seen yet: 0.112 s of lag is 15.7 studs at 140 studs/s, several times the
-	-- reach radius the path answer is compared against. Recorded per part here
-	-- and added to the sample's age before any prediction reads it.
+	-- Draw lag per part. The replicated part is drawn `state.lag` behind the path ThrowFX
+	-- judges; 0.112 s is 15.7 studs at 140 studs/s, so it is added to the sample's age.
 	local lagOf
 	if live then
 		lagOf = {}
@@ -1215,10 +983,8 @@ local function trackBalls(now, live)
 		if part:IsA("BasePart") then
 			local ok, holdDistance = pathCandidate(part)
 			if not ok then
-				-- Two different refusals wear the same clothes here. A ball at a
-				-- hand is correctly ignored; a ball flying with a weld that was
-				-- never cleaned up is the tracker going blind, and the distance
-				-- is what tells them apart.
+				-- Two refusals wearing the same clothes: a ball at a hand, and a flying ball with an
+				-- uncleaned weld. The distance tells them apart.
 				if holdDistance and holdDistance > PALM_RADIUS then
 					drop.weld_far = (drop.weld_far or 0) + 1
 				else
@@ -1226,15 +992,10 @@ local function trackBalls(now, live)
 				end
 			else
 				local rec, verdict = pathSample(ballPath[part], part.Position, now)
-				-- The verdict is stored with the record: the body answer has to
-				-- know whether a trajectory-less record is a ball that just
-				-- arrived or one the tracker stopped seeing.
+				-- Stored with the record: "just arrived" and "stopped being seen" are different answers.
 				rec.verdict = verdict
-				-- After pathSample, because it can return a brand new record.
-				-- nil clears the lag and that is correct: a ball whose draw is
-				-- current - an own throw, a settled ball - has nothing to
-				-- compensate for, and holding a stale lag would advance it past
-				-- where it actually is.
+				-- nil is correct here: a current draw has nothing to compensate for, and a stale lag
+				-- would advance the ball past where it actually is.
 				rec.lag = lagOf and lagOf[part] or nil
 				ballPath[part] = rec
 				drop[verdict] = (drop[verdict] or 0) + 1
@@ -1243,31 +1004,16 @@ local function trackBalls(now, live)
 	end
 end
 
--- The question the body answer actually asks: will this ball pass within reach
--- of the body before the horizon runs out? Answered from the ball's travel
--- between the previous sample and this one, extended forward at the same speed,
--- so it holds on the first frame a ball is ever seen and on the frame after a
--- bounce - the two frames where a velocity estimate and a stale segment both
--- lie. Relative motion, because the hit test leads the body by its own velocity.
+-- Will this ball pass within reach before the horizon runs out? Answered from the travel
+-- between two samples, extended forward - so it holds on the first frame a ball is seen
+-- and on the frame after a bounce.
 --
--- The question is asked *now*, not at the sample. A record is a position at
--- time rec.t, and between rec.t and now the ball has kept moving; at 140 studs/s
--- a single 20 ms of it is 2.8 studs, which is larger than the reach radius the
--- answer is compared against. The position is therefore advanced to this tick
--- before anything is measured. Every prediction in this file that skipped that
--- step was quietly answering about the past.
+-- Asked now, not at the sample: 20 ms of flight at 140 studs/s is 2.8 studs, more than
+-- the reach radius. Both the sample age and the draw lag are advanced before anything is
+-- measured.
 --
--- The sample is also the *drawn* position, and the game draws the ball `lag`
--- seconds behind the path it judges. `rec.lag` is that delay, captured from
--- ThrowFX.Live() when the sample was taken. It is flight the tracker has not
--- seen yet, so it advances the same way time-since-sample does. A ball drawn
--- current reports no lag and the arithmetic is unchanged.
---
--- Returns nil when the ball is receding (its closest approach happened before the
--- previous sample) or when the path clears the reach radius entirely. The fourth
--- return names the rule that answered, so a live report can say which one is
--- throwing away the balls that reach the body - a rejection that is never counted
--- is indistinguishable from a ball that was never tracked.
+-- Returns nil when the ball is receding or clears the radius, plus the rule that
+-- answered, so a rejection is never indistinguishable from a ball never tracked.
 local function pathThreat(rec, now, rootPos, rootVel, horizon, radius)
 	if not (rec and rec.prev and rec.pos and rec.dt and rec.dt > 0) then
 		return nil, nil, nil, "no_sample", nil
@@ -1280,12 +1026,8 @@ local function pathThreat(rec, now, rootPos, rootVel, horizon, radius)
 		return nil, nil, nil, "speed", nil
 	end
 
-	-- The sample is the drawn position, and the draw is `rec.lag` seconds behind
-	-- the ball's real one. Both ages add: the time since the sample AND the
-	-- draw lag it was taken at. Advancing by only the first is why a ball drawn
-	-- 0.112 s in the past read as 15.7 studs further away than it was, and why
-	-- the point-blank class cleared the reach radius on paper while hitting in
-	-- the game.
+	-- Both ages add: time since the sample and the draw lag it was taken at. Advancing by
+	-- one alone read a lagged ball 15.7 studs further away than it was.
 	local age = math.max(0, now - rec.t) + (rec.lag or 0)
 	local posNow = rec.pos + travel * age
 	local delta = posNow - rootPos
@@ -1300,15 +1042,10 @@ local function pathThreat(rec, now, rootPos, rootVel, horizon, radius)
 
 	local miss = (delta + rel * tca).Magnitude
 
-	-- Pessimistic over a window, not optimistic on one sample. A segment is
-	-- refitted every sample, and the fit swings the perpendicular hard: measured
-	-- live on one ball, miss read 15.80 at 18.5 studs, then 2.46 at 10.4, then
-	-- 1.86 at 5.3 inside 0.15 s. Every one of those was "the truth" for its own
-	-- tick, so an answer taken on the newest value is always answering the
-	-- friendlier half of a wobbling estimate. Holding the worst value seen in the
-	-- last fifth of a second answers the ball that is actually closing, and ages
-	-- out on its own so a ball that passed wide is not treated as a threat
-	-- forever.
+	-- Hold the worst miss of the last fifth of a second. A refitted segment swings hard -
+	-- measured on one ball: 15.80 at 18.5 studs, 2.46 at 10.4, 1.86 at 5.3 inside 0.15 s -
+	-- so the newest value is always the friendlier half of a wobbling estimate. The window
+	-- ages out on its own, so a ball that passed wide stops being a threat.
 	do
 		local worstAt = rec.missWorstAt
 		if not worstAt or (now - worstAt) > 0.20 then
@@ -1320,10 +1057,7 @@ local function pathThreat(rec, now, rootPos, rootVel, horizon, radius)
 		miss = math.min(miss, rec.missWorst or miss)
 	end
 
-	-- At the body already. It is here now; the tick that mattered was the one
-	-- before this one, and re-arming a sidestep against a ball that cannot be
-	-- left behind only produces a shoving loop. Reported separately from `miss`
-	-- so a report can tell "cleared the body" from "arrived".
+	-- Already at the body: report it rather than re-arming a shove loop.
 	if delta.Magnitude <= radius then
 		return nil, miss, nil, "inside", tca, posNow
 	end
@@ -1332,12 +1066,8 @@ local function pathThreat(rec, now, rootPos, rootVel, horizon, radius)
 		return nil, miss, nil, "miss", tca, posNow
 	end
 
-	-- The perpendicular offset at closest approach, in the horizontal plane. It
-	-- points from the body TOWARD the point on the ball's line the body will pass
-	-- closest through, so moving along it makes `miss` smaller and moving along
-	-- `-off` makes it bigger. The sign is the whole answer for a dash: the same
-	-- distance spent along `-off` clears, and spent along `off` has to cross the
-	-- line first. Every caller below negates it for exactly that reason.
+	-- Perpendicular offset at closest approach, body toward the line: moving along `-off`
+	-- clears, moving along `off` has to cross the line first. Every caller negates it.
 	local cpa = delta + rel * tca
 	local off = Vector3.new(cpa.X, 0, cpa.Z)
 	if off.Magnitude > 1e-3 then
@@ -1349,24 +1079,11 @@ local function pathThreat(rec, now, rootPos, rootVel, horizon, radius)
 	return math.max(0, tca), miss, travel.Unit, "hit", tca, posNow, off
 end
 
--- A ball that has just arrived has no trajectory to measure, and the speed bound
--- has correctly thrown the hop away. The answer is still owed: the pool parks a
--- ball at (0,-500,0), the server re-places it at the thrower's hand, and from
--- there it crosses the reach radius in ~80 ms - less than the next replication
--- sample. Every predictor in this file needs two positions to say anything, so
--- this is the one case where it has to answer from one: the ball is here, at
--- throwing distance, and the body has to move before the sample exists.
---
--- Priced at the game's fastest legal throw plus the body's own motion toward the
--- ball, which is the earliest it could arrive. The closing speed is the whole
--- point: a body running at the ball meets it sooner than a body standing still,
--- and a body running away meets it later or not at all. Pricing from the ball
--- alone made the stationary case exact and every moving case late, which is the
--- shape that reads as "works when I stop moving".
---
--- Bounded by age: past PATH_ARRIVAL_AGE the record is a ball the tracker lost,
--- not one that just landed, and arming on that would walk the body away from
--- nothing for as long as the ball sat still.
+-- A ball that has just re-placed has no trajectory, and the speed bound threw the hop
+-- away - but it crosses the reach radius in ~80 ms, less than the next sample. Priced at
+-- the game's fastest throw plus the body's own closing speed, so a body running at the
+-- ball meets it sooner and one running away meets it later. Bounded by
+-- PATH_ARRIVAL_AGE: past that the record is a ball the tracker lost.
 local function arrivalThreat(rec, now, rootPos, rootVel, ballVel)
 	if not (rec and rec.pos) then
 		return nil, nil
@@ -1377,13 +1094,9 @@ local function arrivalThreat(rec, now, rootPos, rootVel, ballVel)
 		return nil, nil
 	end
 
-	-- Inside the body lane's reach the question is not which way the ball is
-	-- going. The ball is already in contact range and the next server tick
-	-- resolves it, so the answer is "now" no matter what the velocity says.
-	-- Measured: a world-bounced ball at 2.51 studs with a fresh sample took a
-	-- life while every lane answered `no_sample`; its post-bounce velocity
-	-- pointed away from the body, so the outbound guard below refused the one
-	-- answer that was owed. A ball in contact range is a contact problem.
+	-- Inside the body lane's reach the question is not which way the ball is going. Measured:
+	-- a world-bounced ball at 2.51 studs with a fresh sample took a life while its post-bounce
+	-- velocity pointed away, so every lane answered no_sample. Contact range is contact.
 	local delta = rec.pos - rootPos
 	local distance = delta.Magnitude
 	if distance <= BODY_RADIUS then
@@ -1393,11 +1106,8 @@ local function arrivalThreat(rec, now, rootPos, rootVel, ballVel)
 		return nil, nil
 	end
 
-	-- A ball that is not travelling toward the body is not arriving. One sample
-	-- has no differenced velocity, but the segment it came from does, so the
-	-- direction is readable even on the frame the pair does not exist yet.
-	-- Without this the answer armed on any fresh record inside PATH_NEAR - the
-	-- ball just thrown, and every ball on its way somewhere else.
+	-- A ball not travelling toward the body is not arriving. One sample has no differenced
+	-- velocity, but its segment does, so the direction is readable on the first frame.
 	if ballVel and ballVel:Dot(delta) >= 0 then
 		S.arrivalOutbound = (S.arrivalOutbound or 0) + 1
 		return nil, nil
@@ -1411,11 +1121,8 @@ local function arrivalThreat(rec, now, rootPos, rootVel, ballVel)
 		return nil, nil
 	end
 
-	-- Same draw lag as the path answer. The sample is where the ball was drawn,
-	-- and the ball has been closing at this speed for `lag` seconds since. A
-	-- point-blank arrival that reads 6 studs out while lagged by 5 studs is
-	-- here, not 43 ms away - and that 43 ms is the whole difference between a
-	-- press the judge sees in time and one it sees late.
+	-- Same draw lag: a point-blank arrival reading 6 studs out while lagged 5 studs is here,
+	-- not 43 ms away - and 43 ms is the difference between a press in time and a late one.
 	local remaining = distance - (rec.lag or 0) * closing
 	if remaining <= 0 then
 		return 0, bearing
@@ -1424,56 +1131,25 @@ local function arrivalThreat(rec, now, rootPos, rootVel, ballVel)
 	return remaining / closing, bearing
 end
 
--- Segment-sourced path ---------------------------------------------------------
+-- Segment-sourced path. The part tracker assumes motion lives on the DodgeBalls part; in
+-- this game it does not. Measured over 123 throws across all four classes: the part sits
+-- at the pool position (0,-500,0) for 100% of flight samples - attack 88/88, bot 9/9,
+-- loose 6/6, pass 20/20. Only parts welded into a hand ever move, and those are correctly
+-- refused as carried balls.
 --
--- The part tracker above assumes the ball's motion lives on the DodgeBalls part.
--- In this game it does not. Measured over 123 throws across all four classes: the
--- part sits at the pool position (0,-500,0) for 100% of the flight samples of
--- every class - attack 88/88, bot 9/9, loose 6/6, pass 20/20, parkedFrac 1.00.
--- The only parts that ever move are ones welded into a hand, which are correctly
--- refused as carried balls. So a tracker keyed on the part is blind to every ball
--- in flight, and physicalThreat has never once answered for one: over a full
--- session pathWhy reads hit=1 against no_sample=11021.
---
--- That blindness is not a class difference - it is total - but it explains the
--- reported behaviour exactly. With the body answer dead, a dodge can only be
--- spent by the catch branch as a fallback when pressing is refused, so the body
--- reacts to schedule pressure instead of to contact. The ball that arrives before
--- a press can be sent therefore gets nothing.
---
--- The live segment is the same line the catch predictor reads and it exists for
--- every class, so when the part cannot carry the motion the segment does. Same
--- pathThreat, same reason names, one extra source.
+-- The live segment is the same line the catch predictor reads and exists for every class,
+-- so when the part cannot carry the motion the segment does: same pathThreat, same reason
+-- names, one extra source.
 local segPath = setmetatable({}, { __mode = "k" })
 
--- The game's own answer for "where is this ball at absolute time t".
+-- The game's own answer for "where is this ball at time t". ThrowFX appends every segment
+-- onto `state.hist` and pathAt picks the newest whose t0 has begun, so reading `state.seg`
+-- can read a stale arc: measured on three deaths, the tracker had the ball 3.1-3.9 studs
+-- out while the server-side Impact.pos landed 1.63-2.63 from the root.
 --
--- ThrowFX does not hold one segment per ball: it appends every segment the ball
--- has flown onto `state.hist` and its own `pathAt` picks the newest one whose
--- `t0` has begun. A ball that bounced is on a later segment than the one that
--- was current when the bounce was predicted, and the pre-bounce copies kept on
--- `worldPred.real` / `bounce.real` are the ones that were rolled back.
---
--- Reading `state.seg` and advancing it by `now - t0` therefore reads a stale
--- arc. Measured on the last three deaths: the tracker had the ball 3.1, 3.9 and
--- 3.2 studs out while the server's own impact point (`Impact.pos`, which is the
--- only position in the payload that is not a prediction) landed 1.63, 2.09 and
--- 2.63 studs from the root - inside the 2.4 reach radius. The arc was being
--- extrapolated past the end of its own flight, where a parabola keeps
--- accelerating away from the body. That is also where `past` and `no_sample`
--- came from on the tick that mattered.
--- The flight line the server still has, while ThrowFX's bounce is only a guess.
---
--- `predictBounce` folds the guess into the entry immediately: `worldBounced`
--- goes true, a new segment starts at the bounce time, and the entry's own
--- `hist` gets the ricochet. `undoWorld` puts it back, but that is a whole
--- `WORLD_CONFIRM + ping` later - and the ball keeps flying at the body meanwhile.
---
--- `worldPred.real` is not the guess: ThrowFX re-anchors it from every server
--- update (`ref.worldPred.real = {p0, v0, t0, g}`), so it is the newest flight
--- line the server actually sent. `bounce.real` is the same object for a model
--- bounce, and `bounce.confirmed` says whether the client's version of it came
--- back from the server.
+-- `worldPred.real` is not a guess - ThrowFX re-anchors it from every server update, so it
+-- is the newest flight line the server actually sent. `bounce.real` is the same object for
+-- a model bounce, and `bounce.confirmed` says whether the client's ricochet came back.
 local function preBounceSeg(state)
 	local wp = state.worldPred
 	if state.worldBounced
@@ -1503,12 +1179,9 @@ local function arcAt(state, t)
 			end
 		end
 	end
-	-- A predicted bounce is not a bounce. ThrowFX appends its guess to `hist` the
-	-- moment it forecasts contact, so replaying hist replays the guess - and the
-	-- guess walks the ball away from the body. Measured on two lives: rows read
-	-- `nocanhit bounce` while the drawn ball went 12.9 studs out and climbed to
-	-- 19, and the ball took the life either way. While the bounce is unconfirmed
-	-- the server's own pre-bounce line is the flight, so the replay starts there.
+	-- A predicted bounce is not a bounce. ThrowFX appends its guess to hist the moment it
+	-- forecasts contact, and replaying hist replays the guess: measured on two lives, rows
+	-- read `nocanhit bounce` while the drawn ball went 12.9 studs out and climbed to 19.
 	local pre = preBounceSeg(state)
 	if pre then
 		seg = pre
@@ -1525,23 +1198,15 @@ local function arcAt(state, t)
 	return p, (okV and typeof(v) == "Vector3") and v or nil
 end
 
--- Arc answer. The body lane used to difference the last two drawn samples,
--- which answers only while the ball is mid-flight and never on the frame it
--- arrives; `no_sample` on the arrival frame was the whole failure. This walks
--- the ball's own arc forward over the decision horizon instead: the earliest
--- time the arc comes inside the reach radius, with the body advancing too. It
--- cannot answer `past`, because it never asks about the last tick - only about
--- the next `horizon` seconds.
+-- Arc answer: the earliest time the ball's own arc comes inside the reach radius over the
+-- horizon, with the body advancing too. It never answers `past` - it only asks about the
+-- next `horizon` seconds.
 local ARC_STEP = 1 / 60
 
--- The body is a capsule, not a point. Every distance this file used to take was
--- 3D from the humanoid root, which inflates a ball arriving at chest or head
--- height by the whole vertical offset: measured impact points (`Impact.pos`,
--- server-side, no predictor) landed 0.98-2.77 studs from the root while the
--- server had resolved them as hits, and `BALL_RADIUS + HIT_RADIUS` is 2.4 -
--- so a hit at 2.77 from the root was a hit at under 2.4 from the axis.
--- Clamping the ball's height into the capsule before measuring removes that
--- offset from the only number the hit test cares about.
+-- The body is a capsule, not a point. Distances used to be 3D from the humanoid root,
+-- which inflates a chest-height arrival by the vertical offset: measured Impact.pos
+-- landed 0.98-2.77 from the root as hits, while BALL_RADIUS + HIT_RADIUS is 2.4.
+-- Clamping the ball's height into the capsule fixes the only number the hit test reads.
 local BODY_LOW, BODY_HIGH = -2.2, 1.5
 
 local function capsuleDist(p, body)
@@ -1563,21 +1228,16 @@ local function arcThreat(state, now, rootPos, rootVel, horizon, radius)
 		return nil, first, nil, "inside", 0, p0
 	end
 
-	-- Nothing in the window can close this gap: the ball flies at 95 and the
-	-- body runs at 61, so the fastest possible closure is 156 studs/s.
+	-- Nothing in the window can close this gap: ball 95 + body 61 studs/s.
 	if first > (PATH_THROW_SPEED + 60) * horizon + radius then
 		return nil, first, nil, "beyond", nil, p0
 	end
 
 	local bestD, bestDt, bestPos, bestOff = first, 0, p0, nil
 
-	-- The scan starts slightly in the past. Ticks land ~11 ms apart and the ball
-	-- crosses the capsule between two of them, so a forward-only scan from `now`
-	-- first sees the ball already receding - measured on three deaths, the first
-	-- recorded sample was 3.1 studs out and climbing, while the same ball was
-	-- resolved by the server 0.02 s earlier. A crossing found behind `now` is
-	-- answered at tti 0: the ball is here, and the press or the dash is still
-	-- worth sending.
+	-- The scan starts slightly in the past: ticks land ~11 ms apart and the ball crosses the
+	-- capsule between two of them, so a forward-only scan first sees it already receding. A
+	-- crossing behind `now` answers at tti 0 - the ball is here and the press still counts.
 	local back = -math.ceil(0.08 / ARC_STEP)
 	local n = math.max(1, math.ceil(horizon / ARC_STEP))
 	for i = back, n do
@@ -1632,21 +1292,9 @@ local function livePos(state)
 	return nil
 end
 
--- The flight line, for a ball whose bounce is only a guess.
---
--- ThrowFX predicts wall and model contact itself. The moment it does,
--- `predictBounce` folds the ricochet into the entry: `worldBounced` goes true,
--- `canHit` false, a new segment starts at the bounce time, and the drawn ball
--- follows the predicted roll. If the server disagrees it calls `undoWorld`, but
--- that is a whole `WORLD_CONFIRM + ping` later - and the ball keeps flying at the
--- body in the meantime.
---
--- Measured on one life: the drawn ball tracked a throw 67 -> 12.9 studs, then
--- turned around and walked back out to 19 studs with `nocanhit bounce` on every
--- row, while the same ball took the life. The pre-bounce line - `worldPred.real`,
--- or `bounce.real` for a model bounce - is the flight the server still has.
--- Extrapolated from its own `t0` it passes exactly through the body, which is why
--- the prediction is worth reading and the roll is not.
+-- The flight line for a ball whose bounce is only a guess: worldPred.real, or bounce.real
+-- for a model bounce. Extrapolated from its own t0 it passes through the body, which is
+-- why this prediction is worth reading and the predicted roll is not.
 local function preBouncePos(state, t)
 	local real = preBounceSeg(state)
 	if not real then
@@ -1666,41 +1314,23 @@ local function segSample(state, now, rootPos)
 		return nil
 	end
 
-	-- `seg.t0` is the leg's start. This used to read a bare `t0`, which is a
-	-- global and therefore nil: every record was written with `leg = nil` and
-	-- tested `leg ~= nil`, so a re-anchor that kept the same segment table never
-	-- reset the sample pair and `legT0Changed` never counted once. Measured: the
-	-- counter sat at 0 across eight runs while `legSegChanged` climbed, which is
-	-- the signature of a leg test that can never fire.
+	-- `seg.t0` is the leg's start. This used to read a bare `t0`, which is a global and
+	-- therefore nil, so the leg test could never fire - the counter sat at 0 across eight
+	-- runs while legSegChanged climbed.
 	local legT0 = seg.t0
 
-	-- The drawn ball is the truth. Measured on a live entry: `state.ball.Position`
-	-- (which is `state.drawn`) tracked a `loose` ball 17.8 -> 9.4 studs while the
-	-- same entry's segment sat frozen at 17.7 for the whole run, and an `attack`
-	-- ball read 15.2 on the ball against 14.6 on the segment. The segment is a
-	-- prediction the client keeps re-anchoring; the ball is the position the
-	-- client draws, and the last two deaths were both balls the segment had 9.9
-	-- studs away and receding while the server resolved them on the body.
+	-- The drawn ball is the truth. `state.ball.Position` tracked a loose ball 17.8 -> 9.4
+	-- studs while the same entry's segment sat frozen at 17.7; the segment is a prediction the
+	-- client keeps re-anchoring, and the last two deaths were balls it had 9.9 studs away and
+	-- receding. Fall back to the arc only when there is no ball to read.
 	--
-	-- So difference the ball, and fall back to the arc only when there is no ball
-	-- to read - that is the case the segment lane was invented for and it is
-	-- still real for an entry whose shadow has not spawned yet.
+	-- An unconfirmed bounce is the exception: the drawn ball then takes ThrowFX's guess while
+	-- the server still has the throw coming in, so preBouncePos supplies the line the server
+	-- actually sent.
 	--
-	-- An unconfirmed bounce is the exception, and it is the one that killed.
-	-- ThrowFX draws its guess the moment it predicts contact, so the drawn ball
-	-- takes the predicted ricochet while the server still has the throw coming
-	-- in. Reading the roll answers `miss`/`past` on a ball that is about to
-	-- arrive: measured at 12.9 studs out and receding, four ticks before the
-	-- life left. `preBouncePos` gives the last line the server actually sent -
-	-- ThrowFX re-anchors `worldPred.real` from every server update - so the
-	-- inbound flight is measured until the bounce is real.
-	--
-	-- But the pre-bounce line is not always the inbound one either: measured on
-	-- the next batch, `src=pre` rows walked a ball 6.9 -> 14.2 studs with a
-	-- `past` verdict while the server resolved a hit on it, so preferring that
-	-- source unconditionally simply swapped which curve lied. Whichever curve is
-	-- still closing on the body is the one that can hurt, so the choice is made
-	-- on that, both curves are read this tick, and only one of them is stored.
+	-- That line is not always inbound either - measured on the next batch, src=pre rows
+	-- walked 6.9 -> 14.2 studs with a `past` verdict on a ball the server hit. Whichever
+	-- curve is still closing is the one that can hurt.
 	local pos = livePos(state)
 	local provisional = pos == nil
 	if not pos then
@@ -1716,11 +1346,8 @@ local function segSample(state, now, rootPos)
 			usePre = true
 			provisional = false
 		else
-			-- A curve is "closing" when its own ball velocity points at the body
-			-- right now. Both curves are asked the same question off their own
-			-- segment, so neither source wins by being the one read first. A
-			-- source that cannot produce a velocity is not closing - fail closed,
-			-- because a curve that cannot be checked is a curve that gets skipped.
+			-- Closing means the curve's own ball velocity points at the body right now. Both curves
+			-- are asked the same question, and a source that cannot produce a velocity is not closing.
 			local function closes(p, s)
 				if not s then
 					return false
@@ -1734,14 +1361,9 @@ local function segSample(state, now, rootPos)
 
 			local liveClosing = closes(pos, seg)
 			local preClosing = closes(pre, preBounceSeg(state))
-			-- Substitute only when the drawn curve has stopped closing and the
-			-- pre-bounce line still is. Measured: 22 `src=pre` rows in one batch
-			-- still walked away from the body (`d=2.7`, `tca=-0.121`) because the
-			-- old test took pre whenever live was not closing - which is also true
-			-- when *both* are receding. Two receding curves are a ball that has
-			-- gone by; handing that to the pre-bounce line invents an inbound ball
-			-- out of a dead one and lets it answer `past` on a threat that is
-			-- simply over.
+			-- Substitute only when the drawn curve stopped closing and the pre-bounce line still is.
+			-- Measured: 22 src=pre rows walked away from the body (d=2.7, tca=-0.121) because the old
+			-- test took pre whenever live was not closing - which is also true when both are receding.
 			if preClosing and not liveClosing then
 				pos = pre
 				usePre = true
@@ -1753,16 +1375,11 @@ local function segSample(state, now, rootPos)
 		return nil
 	end
 
-	-- Which curve this sample came from. A prediction that answers `past` on a
-	-- ball that is still coming has one of three sources to blame and they are
-	-- indistinguishable from the numbers alone.
+	-- Which curve this sample came from.
 	local src = usePre and "pre" or (provisional and "arc" or "live")
 
-	-- Keyed on the ball's part, not on the Live entry. ThrowFX rebuilds the entry
-	-- table freely (it is documented as doing so in `tallyHandouts`), and a record
-	-- keyed on a table that is replaced every tick is a record that is created
-	-- every tick - so `prev` never exists and the segment lane answers
-	-- `no_sample` for the whole flight. The part is the pool seat and survives.
+	-- Keyed on the ball's part. ThrowFX rebuilds the Live entry freely, so a record keyed on
+	-- it would start over every tick and answer no_sample for the whole flight.
 	local key = state.part or state
 	local rec = segPath[key]
 	if not rec then
@@ -1783,11 +1400,8 @@ local function segSample(state, now, rootPos)
 			lag = state.lag or 0,
 		}
 		S.segFirstSight = (S.segFirstSight or 0) + 1
-		-- Returned rather than swallowed. A one-sample record cannot be
-		-- differenced, so pathThreat answers `no_sample` on it - but it *can* be
-		-- priced as an arrival, and dropping it here meant the ball's first tick
-		-- inside the reach radius produced no answer at all. That tick is the
-		-- whole point-blank case.
+		-- A one-sample record cannot be differenced but can be priced as an arrival, and that
+		-- first tick inside the reach radius is the whole point-blank case.
 		return segPath[key]
 	end
 
@@ -1796,17 +1410,10 @@ local function segSample(state, now, rootPos)
 	rec.src = src
 	rec.lag = state.lag or 0
 
-	-- A new leg is a new flight. The game re-fits the segment on every bounce and
-	-- on every re-anchor, and the position it reports jumps by however much the
-	-- old leg had drifted. Differencing across that jump produces a travel vector
-	-- that never existed - measured at 105-157 degrees away from the old leg's
-	-- direction on the frames after a bounce - and every downstream answer (miss,
-	-- tca, and above all the dash axis) was built from it. Restart the pair on the
-	-- new leg and say nothing until two samples exist on it.
-	--
-	-- The same applies to a switch of position source: the pre-bounce line and
-	-- the drawn roll are different curves, so differencing one against the other
-	-- is the same fabricated travel vector under a different name.
+	-- A new leg is a new flight. The game re-fits the segment on every bounce and re-anchor,
+	-- and differencing across that jump invents travel - measured 105-157 degrees away from
+	-- the old leg's direction. Restart the pair and say nothing until two samples exist.
+	-- Same rule for a switch of position source: the lines are different curves.
 	if rec.legSeg ~= seg or rec.leg ~= legT0 or rec.usePre ~= usePre then
 		if rec.legSeg ~= seg then
 			S.legSegChanged = (S.legSegChanged or 0) + 1
@@ -1831,9 +1438,7 @@ local function segSample(state, now, rootPos)
 		rec.prev = nil
 		rec.dt = nil
 		rec.t = now
-		-- `first` is what arms arrivalThreat. A record with no pair and a fresh
-		-- stamp is a ball that is here and cannot be differenced, which is the one
-		-- case that predictor exists to answer.
+		-- `first` is what arms arrivalThreat: here, and cannot be differenced yet.
 		rec.verdict = "first"
 		S.pathLegReset = (S.pathLegReset or 0) + 1
 		return rec
@@ -1851,11 +1456,7 @@ local function segSample(state, now, rootPos)
 	return rec
 end
 
--- Does this tracked part actually carry the ball's motion right now? A record
--- only has prev/dt after two genuinely distinct positions at flight speed, and
--- `rec.t` is the time of the last distinct position. A part that moved once and
--- then stopped keeps its old prev/dt, so freshness is part of the test: a stale
--- sample is not motion, it is history.
+-- A stale sample is history, not motion.
 local PART_FRESH = PATH_MAX_GAP
 
 local function partCarries(rec, now)
@@ -1865,28 +1466,17 @@ local function partCarries(rec, now)
 	return (now - (rec.t or 0)) <= PART_FRESH
 end
 
--- One authority for "a ball is physically inbound at the body". Walks the
--- tracked parts, skips anything welded into a hand, and skips a pass while
--- eliminated - a teammate's handout is the route back onto the field, not a
--- threat. Returns the soonest arrival with the direction of travel.
---
--- A ball already at the body is answered `inside` by pathThreat rather than
--- armed again: it is here now, the tick that mattered was the one before this
--- one, and re-arming a sidestep against a ball that cannot be left behind only
--- produces a shoving loop in which the body walks for as long as the ball
--- happens to sit near it.
+-- One authority for "a ball is physically inbound at the body". A ball already at the
+-- body is reported `inside` rather than armed again: re-arming a sidestep against a ball
+-- that cannot be left behind produces a shoving loop.
 local function physicalThreat(character, root, now, horizon, exempt, live)
 	local rootPos = root.Position
 	local localVel = root.AssemblyLinearVelocity
 	local rootVel = Vector3.new(localVel.X, 0, localVel.Z)
 
-	-- The body answer used to take any Live entry that was not held and not our
-	-- own throw. That let a teammate's re-entry pass, a ball the game had already
-	-- stopped marking canHit, and a handout thrown to this player while out all
-	-- arm the body. The catch path has always gone through `isCandidate`; the
-	-- body path now goes through it too, in its soft form: bounce flags stay
-	-- relaxed because a ball off the floor still takes a life, and everything
-	-- that is a handout or a friend's throw while out is dropped.
+	-- The body path goes through isCandidate in its soft form: bounce flags stay relaxed
+	-- because a ball off the floor still takes a life, and handouts or friend throws while
+	-- out are dropped.
 	local out = character and character:GetAttribute(OUT_ATTR) == true
 	local myTeam = character and (character:GetAttribute("Team") or LocalPlayer:GetAttribute("Team"))
 
@@ -1900,19 +1490,10 @@ local function physicalThreat(character, root, now, horizon, exempt, live)
 	local function consider(part, rec, state)
 		local tti, miss, dir, reason, tca, posNow, off
 
-		-- Two sources, chosen by what the record is: a live ball is answered off
-		-- its arc (ThrowFX's own `hist`, so bounces and roll-outs are the game's
-		-- segments and not our guess at them); a tracked part is answered off
-		-- its differenced motion, because that is the only thing a part knows.
-		--
-		-- The lane was chosen once, at sample time, and that is a fault of its
-		-- own: `arcFallback` says the record was sampled with no drawn ball, and
-		-- the entry can lose its segment later in the flight. Measured on three
-		-- lives: the ball left Live() 7.8 studs out, the arc lane answered
-		-- `no_sample` for the whole approach, and the body sat still for 0.4 s
-		-- with `body-notti` because nothing else was ever asked - while the
-		-- record still held a fresh pair it could have been differenced from.
-		-- So a `no_sample` from the arc hands the question to the pair.
+		-- Two sources, chosen by what the record is: a live ball off its arc (ThrowFX's own hist,
+		-- so bounces are the game's segments, not our guess), a tracked part off its differenced
+		-- motion. Chosen per tick, because a record sampled with no drawn ball can gain a segment
+		-- later - measured on three lives where the arc answered no_sample for a whole approach.
 		local arcAnswered = false
 		if rec.seg and rec.arcFallback and state then
 			arcAnswered = true
@@ -1932,10 +1513,8 @@ local function physicalThreat(character, root, now, horizon, exempt, live)
 		why[reason] = (why[reason] or 0) + 1
 		if rec.seg then
 			S.pathWhySeg[reason] = (S.pathWhySeg[reason] or 0) + 1
-			-- The row's `track=` note reads this. A live ball's motion is on the
-			-- segment and its part record is a pool seat, so asking pathThreat
-			-- about the record answers `no_sample/STALE` on the exact tick the
-			-- life leaves - the note was reporting the wrong lane's verdict.
+			-- A live ball's part record is a pool seat, so its verdict would be no_sample on the tick
+			-- the life leaves. The row's track= note reads the lane that actually answered.
 			if part then
 				S.arcLast = S.arcLast or {}
 				S.arcLast[part] = {
@@ -1948,15 +1527,10 @@ local function physicalThreat(character, root, now, horizon, exempt, live)
 			end
 		end
 
-		-- The ball that re-placed itself inside throwing distance. The speed
-		-- bound rejected the hop, so there is no trajectory to extend; the
-		-- bearing is the ball's own and the arrival is priced at the fastest
-		-- legal throw. This is the point-blank shape that used to read
-		-- `no_sample` on every tick while the ball crossed the body.
+		-- The ball that re-placed inside throwing distance: no trajectory to extend, so the
+		-- bearing is its own and the arrival is priced at the fastest legal throw.
 		if not tti and not arcAnswered then
-			-- The one-sample answer needs the ball's own direction, and on the
-			-- frame the record is created there is no pair to difference. The
-			-- segment still has a velocity at this instant, so read it there.
+			-- The one-sample answer needs the ball's own direction; the segment has it.
 			local arrivalVel = nil
 			if state then
 				local _, v = arcAt(state, now)
@@ -1974,29 +1548,16 @@ local function physicalThreat(character, root, now, horizon, exempt, live)
 			end
 		end
 
-		-- Measured from the advanced position, not the drawn one: the
-		-- recorder exists to say how far away the ball was when the decision
-		-- ran, and the drawn position is the one that lied about it.
+		-- Measured from the advanced position, not the drawn one.
 		local distance = ((posNow or rec.pos) - rootPos).Magnitude
 
-		-- Approach events, one per ball, split by who threw it.
-		--
-		-- This is the only measurement in the file that answers the reported
-		-- complaint directly: when a ball actually got to the body, did each
-		-- population get an answer? `near6` is the ball entering six studs -
-		-- close enough that it is plainly coming for this body and not for
-		-- somebody else. `answered` is a stamp the judge would accept on it, or a
-		-- dash already in flight. `ring` is the ball reaching the judge's own
-		-- contact radius. Counting all three per class means the two populations
-		-- are compared on the same question instead of on how many throws the
-		-- game happened to produce.
+		-- Approach events, one per ball, split by thrower: `near6` is the ball entering six
+		-- studs, `answered` a stamp the judge would accept or a dash in flight, `ring` the ball
+		-- reaching the judge's own contact radius.
 		if rec.seg then
 			local kind = rec.kind or "unknown"
-			-- First sighting, in studs. The whole "could we have moved in time"
-			-- question is decided by how far away the ball was the first tick the
-			-- lane could see it, and that number was never recorded - every death
-			-- row was a distance at impact, which is the one distance that cannot
-			-- answer it.
+			-- First sighting in studs: how far away the ball was the first tick the lane could see
+			-- it, which is the only distance that answers "could we have moved in time".
 			if not rec.sightD then
 				rec.sightD = distance
 				local log = S.sightLog
@@ -2063,10 +1624,7 @@ local function physicalThreat(character, root, now, horizon, exempt, live)
 			end
 		end
 
-		-- Flight recorder. Every ball inside the near radius, every tick,
-		-- whatever the verdict. This is the only record that can answer why
-		-- a life was lost: the ball's own distance, the geometry that was
-		-- measured, and the rule that answered, in the order they happened.
+		-- Flight recorder: every ball inside the near radius, every tick, whatever the verdict.
 		if distance <= 20 then
 			wide[#wide + 1] = string.format(
 				"%.2f %s %s%s%s d=%.1f tca=%s miss=%s age=%.3f lag=%.3f src=%s",
@@ -2087,10 +1645,8 @@ local function physicalThreat(character, root, now, horizon, exempt, live)
 			end
 		end
 
-		-- Closest passes, in the order the tracker saw them. The reason is
-		-- kept beside the geometry: a `miss` at 20 studs is a ball aimed at
-		-- somebody else, a `miss` at 2.5 is the one stud of error that lost
-		-- the answer, and `no_sample` says the ball was never sampled at all.
+		-- Closest passes with the reason beside the geometry: a miss at 20 studs is aimed at
+		-- somebody else, a miss at 2.5 is the error that lost the answer.
 		if reason == "hit" or (reason == "miss" and miss and miss <= radius * 3) then
 			close[#close + 1] = string.format(
 				"%.2f %s %s%s tca=%s miss=%.2f dt=%s age=%s d=%.1f lag=%.3f",
@@ -2110,9 +1666,7 @@ local function physicalThreat(character, root, now, horizon, exempt, live)
 			end
 		end
 
-		-- Closest unexplained pass. When the body answer reads zero over a
-		-- round this is the number that says whether balls are clearing the
-		-- reach radius by a stud or by fifty.
+		-- Closest unexplained pass: whether balls clear by a stud or by fifty.
 		if reason == "miss" and miss and miss < (S.pathMinMiss or math.huge) then
 			S.pathMinMiss = miss
 			S.pathMinMissAt = now
@@ -2129,23 +1683,17 @@ local function physicalThreat(character, root, now, horizon, exempt, live)
 		if not pathCandidate(part, exempt) then
 			why.skip = (why.skip or 0) + 1
 		elseif not partCarries(rec, now) then
-			-- Tracked but parked: the part is a seat in the pool, not a ball in
-			-- flight. Answering from it produces the `no_sample` flood that hid
-			-- the dead body answer for a whole session. Counted apart so the
-			-- original reason set keeps its meaning.
+			-- Tracked but parked - a pool seat, not a ball in flight. Counted apart so pathWhy keeps
+			-- its meaning.
 			S.pathWhyPartIdle = (S.pathWhyPartIdle or 0) + 1
 		else
 			consider(part, rec, nil)
 		end
 	end
 
-	-- Parts are sampled; the segment covers what the parts cannot. A ball whose
-	-- part genuinely carries its motion is left to the part tracker alone, so no
-	-- ball is counted twice and no part-derived answer is overridden. "Carries"
-	-- is movement, not membership: every ball in this game is a member of the
-	-- tracker while its part sits in the pool, and measuring membership instead
-	-- of motion routed all of them to the blind source and left the segment with
-	-- nothing to answer for at all.
+	-- Parts are sampled; the segment covers what parts cannot. "Carries" is movement, not
+	-- membership: every ball is a member while its part sits in the pool, and measuring
+	-- membership routed all of them to the blind source.
 	if type(live) == "table" then
 		for _, state in pairs(live) do
 			local part = state.part
@@ -2162,37 +1710,22 @@ local function physicalThreat(character, root, now, horizon, exempt, live)
 					end
 				end
 			elseif not covered then
-				-- Measured, not assumed. The soft filter is the one gate on the Live
-				-- lane, so "does it drop threats" was being answered by reading code.
-				-- The reason is counted by isCandidate itself (`S.laneReject.live`),
-				-- because guessing at it from the thrower name could not separate a
-				-- teammate from an enemy while the session has no Team attribute.
+				-- Counted by isCandidate itself: guessing from the thrower name cannot separate a
+				-- teammate from an enemy.
 				S.pathWhyNotCand = (S.pathWhyNotCand or 0) + 1
 			end
 		end
 	end
 
-	-- The ball that leaves Live() before it arrives. ThrowFX drops an entry the
-	-- instant the judge resolves it, and one of the ways it resolves is by
-	-- landing on this body - so the last few frames of the ball that actually
-	-- takes the life are frames with no Live() entry at all. The part cannot
-	-- answer either: measured at four live deaths, the killer's part sat at the
-	-- pool position 507-510 studs away, `partCarries` correctly refused it, and
-	-- the death read `near=Ball@0.00 [nocanhit,bounce] track=why=no_sample`.
+	-- The ball that leaves Live() before it arrives. ThrowFX drops an entry the instant it
+	-- resolves, and one way it resolves is by landing on this body - so the last frames of
+	-- the killer have no entry at all. Measured at four deaths: the part sat 507-510 studs
+	-- away at the pool position while the death read track=why=no_sample.
 	--
-	-- The segment record survives that drop - it is keyed on the part now, not
-	-- on the entry - so the last sampled position and the pair behind it are
-	-- still here. Answering from them is the only way a ball can be met on the
-	-- frames it stops being reported. Bounded by ORPHAN_MAX_AGE, not by the
-	-- sample gap: a ball that bounced keeps flying for up to a second after the
-	-- entry is gone, and that whole second is time the body could have used.
-	--
-	-- No distance gate on the last sampled position: a ball dropped 140 studs
-	-- out and closing is exactly the one worth answering, and its store position
-	-- is the one number that says nothing about where it is now. The gate that
-	-- matters is the predicted arrival, which pathThreat already applies - the
-	-- extrapolation is monotone, so a record that is genuinely old predicts a
-	-- ball already past the body and is refused there.
+	-- The segment record is keyed on the part, so it survives the drop. Bounded by
+	-- ORPHAN_MAX_AGE: a bounced ball keeps flying for up to a second after the entry is gone.
+	-- No distance gate - the extrapolation is monotone, so an old record predicts a ball past
+	-- the body and is refused there.
 	for key, rec in pairs(segPath) do
 		local part = typeof(key) == "Instance" and key or nil
 		if part and not liveParts[part] then
@@ -2240,10 +1773,8 @@ local function canPress(character, now)
 		return false, "out"
 	end
 
-	-- The server enforces CATCH_COOLDOWN (0.6 s) after every catch and publishes it
-	-- as CatchReadyAt. Pressing inside that window is guaranteed to be refused, so
-	-- it is spent on nothing. The sanity bound keeps a stale or replayed value from
-	-- disabling catching for the rest of the round.
+	-- The server enforces CATCH_COOLDOWN after every catch and publishes it as CatchReadyAt;
+	-- pressing inside it is refused. The bound keeps a stale value from disabling catching.
 	local catchReady = readyAt(character, "CatchReadyAt")
 	if catchReady and now < catchReady and catchReady < now + 10 then
 		return false, "cooldown"
@@ -2252,10 +1783,8 @@ local function canPress(character, now)
 	return true, "ok"
 end
 
--- The server's acceptance test for a stamp, written once. `age` is how old the
--- stamp is when the ball is judged: inside [-0.03, CATCH_WINDOW] it catches,
--- outside it cannot. Every schedule decision below is this one call, so the
--- schedule and the fallback can never disagree about what "armed" means.
+-- The server's acceptance test for a stamp, written once: inside [-0.03, CATCH_WINDOW] it
+-- catches. Every schedule decision is this call, so schedule and fallback cannot disagree.
 local function inJudgeBand(stamp, contactAt, window)
 	if not (stamp and contactAt) then
 		return false
@@ -2266,14 +1795,9 @@ local function inJudgeBand(stamp, contactAt, window)
 end
 
 -- Refresh a stamp once it would be this far into the judge window at contact.
--- Below 1.0 the freshest stamp is always replaced while it is still valid, so
--- the catch never depends on a prediction made more than a fraction of a second
--- early.
 local PRESS_REFRESH = 0.40
 
--- Mirror of the client half of ThrowFX.catching(), diagnostics only: it says in
--- advance which limb of the judge would reject a press, so a round gives a tally
--- instead of a mystery.
+-- Mirror of ThrowFX.catching(), diagnostics only: which limb would reject a press.
 local function judgePress(character, root, tti, dir, now)
 	if not tti then
 		return "no threat"
@@ -2302,21 +1826,10 @@ local function judgePress(character, root, tti, dir, now)
 	return "ok"
 end
 
--- Arrival race classifier, pure: takes the facts that are authoritative at the
--- instant the contact clock reaches zero and names which answer lost. The order
--- mirrors the server's own contact chain - i-frames, then the catch judge, then
--- the hands, then the body - so a verdict that says `catch` and a life that
--- still dropped is a genuine client/server disagreement, not our timing.
+-- Arrival race classifier, pure: names which answer lost the instant the contact clock
+-- reached zero, in the server's own order - i-frames, catch judge, hands, body.
 --
--- Verdicts:
---   dash       i-frames covered this instant
---   catch      a stamp was inside the window and CatchReadyAt was past
---   hands      HasBall while the ball arrived
---   catch-cool a stamp was inside the window but CatchReadyAt was still ahead
---   dash-miss  a dash was spent, its i-frames had already run out
---   no-press   no stamp and no dash on this ball
---   past       a stamp existed but the judge window had gone by
---   pred-miss  the arrival was never predicted at all
+-- dash / catch / hands / catch-cool / dash-miss / no-press / past / pred-miss.
 local function raceVerdict(f)
 	if not f or not f.tti then
 		return "pred-miss"
@@ -2401,24 +1914,15 @@ local function scheduleDue(contactAt, stamp, now, window, rearm, lastPress, cade
 	return false, "held"
 end
 
--- Whether the catch will cover a ball judged at `contactAt`. The stamp is not
--- per ball: ThrowFX.catching() reads one attribute, `CatchPressT`, and compares
--- it with the judge time of whichever ball has arrived. A press made while
--- watching a different ball therefore still catches this one, which is why the
--- decision is stated over the stamp and the clock rather than over a ball id.
---
--- Each disqualifier is a refusal the server itself makes: no stamp at all, a
--- stamp outside the window at contact, CatchReadyAt still in the future when the
--- ball lands, or this exact ball already answered "Refused".
+-- Whether the catch covers a ball judged at `contactAt`. The stamp is not per ball -
+-- ThrowFX reads one CatchPressT attribute and compares it with whichever ball arrived -
+-- so the decision is stated over the stamp and the clock, not over a ball id.
 local function catchCovers(stamp, contactAt, window, readyBy, refused, catchable)
 	if not (stamp and contactAt) then
 		return false
 	end
-	-- A ball the judge cannot accept is not covered by any stamp. This is the
-	-- difference between "a press is in flight" and "a press is in flight for
-	-- THIS ball": a bounced ball, or one the game has stopped marking canHit, is
-	-- refused by the judge by construction, so standing the body down for it is
-	-- standing still for a ball that was never catchable.
+	-- A ball the judge cannot accept is covered by no stamp. That is the difference between
+	-- "a press is in flight" and "a press is in flight for THIS ball".
 	if catchable == false then
 		return false
 	end
@@ -2431,14 +1935,9 @@ local function catchCovers(stamp, contactAt, window, readyBy, refused, catchable
 	return inJudgeBand(stamp, contactAt, window)
 end
 
--- Which answer the contact audit records, stated once so it can be asserted.
---
--- `covered` is the judge accepting the stamp for this contact. `late` is a press
--- that exists and missed the band, which means the schedule was armed for this
--- ball but a fraction of a second off. `nostamp` is no press for this ball at
--- all: either none was sent, or the only stamp on record is older than a second
--- past the window and therefore belongs to some earlier ball. The stamp is never
--- cleared, so the distinction has to be made on age, not on existence.
+-- Which answer the contact audit records: `covered` the judge accepts, `late` a press
+-- that missed the band, `nostamp` no press for this ball. The stamp is never cleared, so
+-- the distinction is made on age, not existence.
 local CONTACT_STALE = 1.0
 
 local function contactVerdict(covered, stampAge, window)
@@ -2461,11 +1960,9 @@ local function press(character, now)	local stamp = now - CONFIG.pressBias
 	Action:FireServer("Catch", stamp)
 	ThrowFX.MarkAction(character, "Catch", stamp)
 
-	-- Every press is logged against the stamp that was actually sent, because the
-	-- server answers with that same stamp. Pressing is not free: the server arms
-	-- CatchReadyAt whether the catch lands or is refused, so a press that cannot
-	-- land costs the next 0.6 s of catching outright. Mapping presses to answers
-	-- is the only way to see which condition is producing refusals.
+	-- Every press is logged against the stamp actually sent, because the server answers with
+	-- that same stamp. Pressing is not free: it arms CatchReadyAt whether the catch lands or
+	-- not, so mapping presses to answers is the only way to see what produces refusals.
 	local meta = S.pressMeta or {}
 	local rec = {
 		stamp = stamp,
@@ -2498,27 +1995,19 @@ local function press(character, now)	local stamp = now - CONFIG.pressBias
 	S.stampCount = S.stampCount + 1
 end
 
--- Throw ----------------------------------------------------------------------
---
--- Replica of DodgeInput.doThrow's server call, minus the aim assist, charge and
--- ability branches. Only fires when the hands are full and a hit is predicted,
--- because a full pair of hands is the one state the server refuses to catch in.
+-- Throw: DodgeInput.doThrow's server call, minus aim assist, charge and ability branches.
+-- Only fires when the hands are full and a hit is predicted.
 
 local throwSeq = 100000
 
--- Cover time for the palm ball: long enough to cover the round trip, short
--- enough that a refused throw cannot leave a hole. The real decision is made by
--- reconcileThrow once THROW_ACK_WAIT has passed without a server ack.
+-- Cover time for the palm ball: long enough for the round trip, short enough that a
+-- refused throw leaves no hole. reconcileThrow decides once THROW_ACK_WAIT passes.
 local THROW_COVER = 0.6
 local THROW_ACK_WAIT = 0.5
 
--- DodgeInput.heldBallPart, verbatim: the ball welded to the right hand is the one
--- the client is drawing in the palm, and it is the part doThrow hides after the
--- remote fires.
---
--- The weld outlives the throw for a moment, and during that moment the ball is
--- already in flight. Returning it as "held" then hides a ball the player is
--- watching fly, so a candidate also has to be at the hand, not just welded to it.
+-- DodgeInput.heldBallPart: the ball welded to the right hand is the one being drawn in
+-- the palm. The weld outlives the throw, so a candidate must also be AT the hand -
+-- otherwise it hides a ball the player is watching fly.
 local function heldBallPart(character)
 	local hand = character and (character:FindFirstChild("RightHand") or character:FindFirstChild("Right Arm"))
 	local balls = Workspace:FindFirstChild("DodgeBalls")
@@ -2535,32 +2024,21 @@ local function heldBallPart(character)
 	end
 end
 
--- Palm guard ------------------------------------------------------------------
+-- Palm guard. The palm is drawn from the ball instance, not from HasBall, and it is
+-- hidden with LocalTransparencyModifier - a client-only property. ThrowFX.HidePart writes
+-- 1 and records an expiry that nothing in the module ever reads, so a hidden part stays
+-- hidden until unrelated code touches it.
 --
--- The palm is drawn from the ball instance, not from HasBall, and it is hidden
--- with LocalTransparencyModifier, a client-only property. ThrowFX.HidePart writes
--- 1 and records an expiry in its own table, but nothing in the module ever reads
--- that expiry - only ShowPart clears it - so a hidden part stays hidden until
--- unrelated code happens to touch it.
+-- That is the ghost, and it was ours: HidePart ran on every throw for 6 s, and when the
+-- server handed the same ball back to the hand it arrived already invisible while
+-- HasBall was true. The old sweep only restored parts it had hidden itself.
 --
--- That is the ghost, and it was ours. HidePart ran on every throw for
--- MAX_FLIGHT + 2 (6 s). When the server handed the same ball instance back to the
--- hand - pooling, or a throw it refused - the part arrived welded in the palm with
--- LocalTransparencyModifier already at 1 while HasBall was true: a held ball drawn
--- invisible. The old sweep only restored parts it had hidden itself, through
--- `palmHidden`, and the watchdog only ever looked for a *visible* ball that should
--- not be there. Both counters therefore read zero while the hand drew nothing.
---
--- So the palm is now derived from the server's own HasBall every frame instead of
--- from a timer: held means drawn, empty means hidden. The one exception is the
--- throw's own cover, bounded by THROW_COVER, which always ends by re-reading the
--- server. A refused or dropped throw cannot leave a ball hidden, duplicated, or
--- stuck in the palm.
+-- So the palm is derived from the server's HasBall every frame: held means drawn, empty
+-- means hidden. The one exception is a throw's own cover, bounded by THROW_COVER.
 
 local palmHidden = setmetatable({}, { __mode = "k" })
 
--- True for the window in which a throw's own cover may legitimately be hiding the
--- palm ball. Outside it, HasBall alone decides what the palm draws.
+-- True while a throw's own cover may legitimately hide the palm ball.
 local function coverActive(now)
 	return now - (S.lastThrow or -math.huge) < THROW_COVER
 end
@@ -2581,22 +2059,16 @@ local function sweepThrown(character, now)
 			local inPalm = delta.Magnitude <= PALM_RADIUS and math.abs(delta.Y) <= PALM_DY
 
 			if inPalm and has then
-				-- The server says a ball is held, so the palm must draw one. This is
-				-- unconditional and outside any timer: whatever hid the part, the
-				-- held ball is shown again.
+				-- The server says a ball is held, so the palm draws one - whatever hid it.
 				if ball.LocalTransparencyModifier ~= 0 then
 					ball.LocalTransparencyModifier = 0
 					S.palmRestores = (S.palmRestores or 0) + 1
 				end
 				palmHidden[ball] = nil
 			elseif inPalm and not has then
-				-- Empty hands: nothing may be drawn in the palm. Unconditional, for
-				-- the same reason - a ball left behind there is exactly the display
-				-- bug, and the weld cannot be trusted to identify it (a thrown ball
-				-- keeps its weld downrange, and a ball left in the palm after a
-				-- refused throw is not welded at all). The test is geometric, so it
-				-- catches every shape; a ball merely passing through is hidden for
-				-- the frames it overlaps, then shown again by the branch below.
+				-- Empty hands: nothing may be drawn in the palm. The test is geometric because the weld
+				-- cannot identify it - a thrown ball keeps its weld downrange, and a ball left behind by
+				-- a refused throw is not welded at all.
 				if ball.LocalTransparencyModifier ~= 1 then
 					ball.LocalTransparencyModifier = 1
 					S.thrownHides = (S.thrownHides or 0) + 1
@@ -2610,11 +2082,7 @@ local function sweepThrown(character, now)
 	end
 end
 
--- Palm watchdog. A ball leaving the hand is normal for two frames; a visible ball
--- that is still sitting in the palm half a second later with no server flag is a
--- ghost, and reporting it is the only way to tell a real display bug from a
--- passing impression. Cheap: one 0.1 s pass over DodgeBalls, and only while the
--- hand is empty.
+-- Palm watchdog: a visible ball still in the palm with no server flag is a ghost.
 local function watchPalm(character, now)
 	if now - (S.palmAt or 0) < 0.05 then
 		return
@@ -2628,16 +2096,11 @@ local function watchPalm(character, now)
 		return
 	end
 
-	-- The ball the server says we are holding is allowed to be in the hand. Any
-	-- other visible ball in the same place is the display bug.
+	-- The ball the server says is held may be in the hand; any other visible one is the bug.
 	local held = heldBallPart(character)
 
-	-- The blind spot the old watchdog had: it looked for a visible ball that
-	-- should not be there and never for the inverse - a ball the server says is
-	-- ours, welded in the palm, drawn at LocalTransparencyModifier = 1. That is
-	-- exactly the shape a refused throw leaves behind, and on screen it reads as
-	-- a ghost while every visible-ball counter stays at zero. A pending throw is
-	-- excluded because its cover is legitimately up for one round trip.
+	-- The old blind spot: it looked for a visible ball that should not be there and never
+	-- for a ball the server says is ours, welded in the palm, drawn at transparency 1.
 	local has = LocalPlayer:GetAttribute("HasBall") == true
 	if has and not coverActive(now) and held and held.LocalTransparencyModifier >= 0.5 then
 		S.palmInvis = (S.palmInvis or 0) + 1
@@ -2654,9 +2117,8 @@ local function watchPalm(character, now)
 	for _, ball in ipairs(balls:GetChildren()) do
 		if ball ~= held and ball:IsA("BasePart") and ball.LocalTransparencyModifier < 0.5 and ball.Transparency < 0.5 then
 			local delta = ball.Position - hand.Position
-			-- A ball in the palm sits at hand height and inside the palm. A loose
-			-- ball on the floor next to a standing player is not a ghost, and
-			-- counting it as one hides the real thing.
+			-- A ball in the palm sits at hand height and inside the palm; a loose ball on the floor
+			-- next to a standing player is not a ghost.
 			if delta.Magnitude <= 3 and math.abs(delta.Y) <= 2.5 then
 				found = ball
 				break
@@ -2664,8 +2126,7 @@ local function watchPalm(character, now)
 		end
 	end
 
-	-- The render proxy is what the player actually sees for a fast ball, so a
-	-- stuck glide part looks exactly like a ball parked in the hand.
+	-- The render proxy is what the player sees for a fast ball.
 	local fx = Workspace:FindFirstChild("DodgeFX_Local")
 	if not found and fx then
 		for _, part in ipairs(fx:GetChildren()) do
@@ -2701,14 +2162,8 @@ local function watchPalm(character, now)
 	end
 end
 
--- Who is worth throwing at. The same population DodgeInput's kindOf accepts as an
--- enemy, minus the states where a hit cannot mean anything:
---   * Out        - eliminated this round, walks the sidelines and can still throw
---                  at the arena from outside; hitting them does nothing
---   * InPrison   - jailed, no hit registration
---   * no Health  - dead body still in the world
---   * not InMatch / Lives 0 - waiting on a respawn
---   * ProtectedUntil - spawn shield, shots pass through
+-- Who is worth throwing at: not Out, not InPrison, no Health, not InMatch, Lives 0, or
+-- ProtectedUntil.
 local function isEngageable(model, myTeam, now)
 	if not model then
 		return false
@@ -2756,12 +2211,8 @@ local function isEngageable(model, myTeam, now)
 	return true
 end
 
--- Line of sight --------------------------------------------------------------
---
--- The nearest enemy is often on the other side of a rail, a barrier or a wall,
--- and a throw at them spends the ball on masonry. Prefer the nearest enemy the
--- hand can actually reach, and fall back to the nearest one when nobody is
--- visible (hands need to be free either way).
+-- Prefer the nearest enemy the hand can actually reach, and fall back to the nearest one
+-- when nobody is visible - the hands need to be free either way.
 
 local losParams = RaycastParams.new()
 losParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -2850,20 +2301,9 @@ local function nearestEnemy(character, myTeam, origin)
 	return best or fallback
 end
 
--- The decision itself, pure: three replicated facts, one answer - can this
--- target return the throw?
---
---   hasBall      -> no. ThrowFX.catching answers "has a ball" while a player
---                   holds one, so a thrower with a ball cannot catch.
---   out          -> no. An eliminated player is not a target at all.
---   catchReadyAt -> no while it is still in the future: the server answers
---                   "cooldown" until then. A far-future value is a stale or
---                   replayed attribute, not a cooldown, hence the sanity bound.
---
--- Everything else and the ball gets through or misses. A throw into a catcher's
--- hands is not a hit, it is an elimination: the catcher is credited and the
--- thrower is out. That is the only remaining way the assist loses a life now, so
--- the throw is aimed only where this returns false.
+-- Can this target return the throw? Only three replicated facts matter: hasBall -> no,
+-- out -> no, catchReadyAt in the future -> no. Everything else and the ball gets through
+-- or misses. A throw into a catcher's hands is an elimination, not a miss.
 local function targetCanCatch(hasBall, out, catchReadyAt, now)
 	if hasBall then
 		return false
@@ -2877,10 +2317,8 @@ local function targetCanCatch(hasBall, out, catchReadyAt, now)
 	return true
 end
 
--- Whether a target can answer a throw that leaves now. Facing is deliberately not
--- consulted - an assist-equipped enemy snaps to face an inbound ball, so facing
--- at release says nothing about facing at arrival, and treating it as safety
--- would be a coin flip dressed as a check.
+-- Facing is not consulted: an assist snaps to face an inbound ball, so facing at release
+-- says nothing about facing at arrival.
 local function canCatchThrow(target, now)
 	if not target then
 		return false
@@ -2900,16 +2338,10 @@ local function canCatchThrow(target, now)
 	return targetCanCatch(hasBall, out, readyAt(target, "CatchReadyAt"), now)
 end
 
--- Perfect aim -----------------------------------------------------------------
---
--- The game's hit test does not test the body you can see. ThrowFX.touch() asks
--- TargetPoint for a *lead* position:
---   * the target's own client rewinds it by Back() = BPView + BPBack,
---   * every other machine leads it by FlatVel * 0.5 * (VIEW_DELAY + ping * 0.5),
---   * TargetPoint.Tested() then adds FlatVel * Lead() where Lead is BPLead + BPShare.
--- So the ball has to be aimed where the target will be when the ball arrives, and
--- then a little further, by that same lag lead. DodgeInput.bodyTarget iterates this
--- twice; twice leaves 1-3 studs of error at range, which is why a clean shot in the
+-- The hit test does not test the body you can see. ThrowFX.touch() asks TargetPoint for a
+-- lead position: rewound on the target's own client, led by FlatVel across the view delay
+-- and half a ping everywhere else, plus TargetPoint.Tested's own lead. DodgeInput.bodyTarget
+-- iterates twice and leaves 1-3 studs of error at range, which is why a clean shot in the
 -- crosshair still misses a moving target. This iterates to convergence.
 
 local function flatVelOf(root)
@@ -2935,12 +2367,8 @@ local function perfectAim(character, root, target, targetRoot)
 	end
 	aim = aim + chest
 
-	-- Fixed point: the flight time depends on where the ball is aimed and the
-	-- lead depends on the flight time. TargetPoint.Tested already carries the
-	-- lag lead the hit test applies (leadPos: half flat velocity across the view
-	-- delay plus half a ping), so adding a second lead here overshoots the
-	-- capsule at range. This iterates the game's own bodyTarget to convergence
-	-- and nothing more.
+	-- Fixed point: flight time depends on the aim point and the lead depends on flight time.
+	-- TargetPoint.Tested already carries the lag lead, so a second one overshoots at range.
 	for _ = 1, 6 do
 		local t = (aim - origin).Magnitude / speed
 		local base = TargetPoint.Tested(character, target, targetRoot)
@@ -2953,14 +2381,8 @@ local function perfectAim(character, root, target, targetRoot)
 	return aim
 end
 
--- Silent aim ------------------------------------------------------------------
---
--- DodgeInput.doThrow resolves an aim point from the camera ray and hands it to
--- Action:FireServer("Throw", aim, origin, stamp, seq, passTarget, attackTarget,
--- attackTargetPos). The server rebuilds the trajectory from that point, so the
--- redirect has to happen on the argument, not on the view. One detour is
--- installed for the whole session and reused across reloads; a new load swaps the
--- rewrite closure instead of stacking a second hook.
+-- The server rebuilds the trajectory from the aim argument, so the redirect happens on
+-- the argument, never on the view. One detour for the session, reused across reloads.
 
 local function pointLockOn(target)
 	if not CONFIG.lockOnTarget then
@@ -2986,10 +2408,8 @@ if not SILENT_HOOK then
 
 	local function handler(self, ...)
 		local state = SILENT_HOOK
-		-- The rewrite is a hold-only assist, as asked: with the button down it
-		-- redirects a hand-aimed throw at the solved intercept, and with the button
-		-- up the player's own aim goes out untouched. The script's own auto-throw
-		-- never needs it - throwHeld already solves the intercept before it fires.
+		-- Hold-only: with the button down a hand-aimed throw is redirected at the solved
+		-- intercept. Auto-throw already solves its own and is left alone.
 		if not state.active or self ~= state.action or not S.aimHeld then
 			return state.original(self, ...)
 		end
@@ -3022,10 +2442,8 @@ end
 SILENT_HOOK.action = Action
 SILENT_HOOK.active = CONFIG.silentAim == true
 SILENT_HOOK.rewrite = function(args)
-	-- The script's own throws already leave the hand aimed at a solved intercept
-	-- point (throwHeld), so re-solving them here only adds a second, slightly
-	-- different answer to the same question. Leave those untouched; the detour is
-	-- for throws the player aimed by hand.
+	-- Our own throws already leave the hand aimed at a solved intercept, so re-solving them
+	-- only adds a second answer. The detour is for throws the player aimed by hand.
 	if args[4] ~= nil and args[4] == S.lastThrowStamp and args[5] == S.lastThrowSeq then
 		S.nativeThrows = S.nativeThrows + 1
 		return
@@ -3069,36 +2487,27 @@ SILENT_HOOK.rewrite = function(args)
 end
 
 local function throwHeld(character, root, now, requireTarget, urgent)
-	-- The 0.38 s cooldown is ours, not the server's: the game's own throw gate is
-	-- the ball itself. Holding a ball is the one state where no catch is possible,
-	-- so when a ball is already closing, spending this cooldown means eating the
-	-- hit with a ball in hand. An urgent call skips it.
+	-- Our cooldown, not the server's. Holding a ball is the one state where no catch is
+	-- possible, so an urgent call skips it.
 	if not urgent and (now - S.lastThrow) < CONFIG.throwCooldown then
 		return false
 	end
 
-	-- The server owns HasBall. A throw fired without it is a local-only ghost:
-	-- the client plays the wind-up and keeps drawing a ball in the palm, nothing
-	-- moves on the server, and nothing can be hit with it. That ghost is what the
-	-- extra "still shootable" ball in hand was, so the gate lives here, in the one
-	-- function every throw path goes through.
+	-- The server owns HasBall. A throw without it is a local-only ghost: the client plays the
+	-- wind-up, nothing moves on the server, and nothing can be hit with it.
 	if LocalPlayer:GetAttribute("HasBall") ~= true then
 		return false
 	end
 
-	-- A sidelined player throws to get back in: a hit while eliminated returns him
-	-- to his side. The server judges that throw like any other, so it is not
-	-- gated here. `requireTarget` is the caller's way of refusing to spend the
-	-- ball into empty air.
+	-- A sidelined player throws to get back in, and the server judges that throw like any
+	-- other, so it is not gated here. `requireTarget` is the caller's refusal to waste it.
 	local myTeam = character:GetAttribute("Team") or LocalPlayer:GetAttribute("Team")
 	local target = nearestEnemy(character, myTeam, root.Position)
 	local targetRoot = target and target:FindFirstChild("HumanoidRootPart")
 
-	-- Never throw into a catcher. The ball comes back as the elimination, and no
-	-- amount of aim fixes it - the enemy only has to press. A safe recipient is an
-	-- enemy holding a ball or still on the catch cooldown; with nobody safe the
-	-- ball is thrown downrange instead, which still frees the hand for the next
-	-- catch and gives the enemy nothing to catch.
+	-- Never throw into a catcher - it comes back as the elimination. A safe recipient holds a
+	-- ball or is still on cooldown; with nobody safe the ball goes downrange, which still
+	-- frees the hand and gives the enemy nothing to catch.
 	if target and canCatchThrow(target, now) then
 		S.throwUnsafe = (S.throwUnsafe or 0) + 1
 		target = nil
@@ -3147,10 +2556,8 @@ local function throwHeld(character, root, now, requireTarget, urgent)
 	-- moved, the glide would start away from the palm.
 	local held = heldBallPart(character)
 
-	-- Registered before the remote fires, not after. The server's confirmation can
-	-- land on the next frame, and anything the throw path does between FireServer
-	-- and this assignment - an animation call that yields - is a window in which
-	-- the ack has nobody to match. That window is why every throw looked refused.
+	-- Registered before the remote fires: the server's ack can land on the next frame, and
+	-- anything that yields in between leaves the ack with nobody to match.
 	S.throwPending = {
 		part = held,
 		at = now,
@@ -3176,23 +2583,16 @@ local function throwHeld(character, root, now, requireTarget, urgent)
 	S.lastThrowSeq = throwSeq
 	Action:FireServer("Throw", aimPos, origin, stamp, throwSeq, nil, nil, nil)
 
-	-- The client half of the throw. doThrow does all of this after the remote, and
-	-- without it the client keeps drawing the welded ball in the palm: the model
-	-- is never hidden, the hold animation never stops, and a second throw can fire
-	-- against a ball the server has already taken away. Same calls, same order.
+	-- The client half of the throw, same calls and order as doThrow. Without it the client
+	-- keeps drawing the welded ball and a second throw can fire against a ball already gone.
 	pcall(function()
 		DodgeAnims.Stop(character, "ThrowWindup", 0.03)
 		DodgeAnims.Stop(character, "HoldBall", 0.05)
 		DodgeAnims.Play(character, "Throw", { fadeIn = 0.03, fadeOut = 0.15 })
 	end)
 
-	-- No HidePart here. ThrowFX.HidePart writes LocalTransparencyModifier = 1 and
-	-- records an expiry nothing in the module ever reads, so a part it hid stayed
-	-- hidden until unrelated code touched it - which is exactly how a ball the
-	-- server handed back into the same hand came back invisible. The palm is now
-	-- drawn from HasBall alone in sweepThrown: held means drawn, empty means
-	-- hidden. The cost is one round trip of a visible ball in the palm after a
-	-- throw; the alternative was a ghost with no expiry.
+	-- No HidePart here: it hides a part nothing ever shows again, which is how a ball the
+	-- server handed back came back invisible. The palm is drawn from HasBall alone.
 	if held then
 		S.thrownPart = held
 		S.thrownAt = now
@@ -3205,23 +2605,12 @@ local function throwHeld(character, root, now, requireTarget, urgent)
 	return true
 end
 
--- Throw reconciliation --------------------------------------------------------
+-- Throw reconciliation. A throw is display-only until the server acks it: accepted reuses
+-- the prediction, refused or dropped means a phantom throw followed by an empty hand
+-- holding a real ball.
 --
--- One throw, three things that can be wrong, all of them display-only:
---
---   accepted  -> the server broadcasts `Throw` on DodgeFX FX carrying `ref` equal
---                to the id we gave Predict, so the prediction is reused and the
---                ball leaves the hand. Cover expires on its own.
---   refused   -> no broadcast ever arrives. The prediction would fly for 1.2 s
---                and then vanish, and the palm ball would stay hidden for the
---                whole cover window with the ball still ours. That is the ghost:
---                a phantom throw followed by an empty hand holding a real ball.
---   dropped   -> same as refused from the client's side.
---
--- So the throw is only believed once the server says so. If `THROW_ACK_WAIT`
--- passes with no ack and the ball is still welded in the palm, the prediction is
--- stopped and the part is shown again. `ShowPart` clears ThrowFX's own expiry
--- entry, and the direct write covers the case where that entry is already gone.
+-- So if THROW_ACK_WAIT passes with no ack and the ball is still welded in the palm, the
+-- prediction is stopped and the part shown again.
 
 local function reconcileThrow(character, now)
 	local pending = S.throwPending
@@ -3244,9 +2633,8 @@ local function reconcileThrow(character, now)
 	local part = pending.part
 	local hand = character and (character:FindFirstChild("RightHand") or character:FindFirstChild("Right Arm"))
 
-	-- Still welded to the hand and still inside the palm means the server never
-	-- took the ball away: the throw did not happen. Anything else means the ball
-	-- did leave (or was replaced) and the cover should be left to expire.
+	-- Still welded and still inside the palm means the server never took the ball: the throw
+	-- did not happen. Anything else means it left and the cover should expire on its own.
 	if part and hand and part.Parent == Workspace.DodgeBalls and (part.Position - hand.Position).Magnitude <= PALM_RADIUS then
 		pcall(ThrowFX.ShowPart, part)
 		part.LocalTransparencyModifier = 0
@@ -3273,17 +2661,10 @@ local function reconcileThrow(character, now)
 	recon[#recon + 1] = string.format("clear delta=%.3f acked=%s seq=%d", now - pending.at, tostring(pending.acked), pending.seq)
 end
 
--- UI -------------------------------------------------------------------------
---
--- Two surfaces, one job each. The HUD line stays where it was - one glanceable
--- string in the corner, no interaction. The panel is the control surface: every
--- toggle and slider writes straight into CONFIG and the live state, so what the
--- panel says is what the assist is doing, never a copy that can drift.
---
--- Fluent is the Microsoft-Fluent-style library: static panel, no animated hub, no
--- dependencies beyond the loadstring. It is loaded through pcall because the
--- assist has to keep working with no internet - a missing panel must not take the
--- catch and dash down with it.
+-- Two surfaces, one job each: a glanceable HUD line and a control panel. Every control
+-- writes straight into CONFIG and the live state, so the panel cannot drift from the
+-- assist. Fluent is loaded through pcall - a missing library must not take the catch and
+-- dash down with it.
 
 local gui
 local label
@@ -3334,9 +2715,8 @@ local function paint(text, good)
 	end
 end
 
--- One summary string, built from the same counters the diagnostics read. This is
--- what the HUD shows and what the panel's status paragraph refreshes to, so the
--- two can never tell different stories.
+-- One summary string from the same counters the diagnostics read, so the HUD and the
+-- panel cannot tell different stories.
 local function summaryText()
 	return string.format(
 		"catch %s  |  press %d  ack %d  |  hit %d  bad %d  |  dash %d  side %d  |  path open %d fired %d",
@@ -3381,8 +2761,7 @@ local function buildPanel()
 		SubTitle = "dodgeball assist",
 		TabWidth = 150,
 		Size = UDim2.fromOffset(540, 430),
-		-- Off on purpose. Acrylic re-blurs the game every frame, and this script's
-		-- whole argument is that a frame must not be spent where an answer lives.
+		-- Off on purpose: acrylic re-blurs the game every frame.
 		Acrylic = false,
 		Theme = "Dark",
 		MinimizeKey = Enum.KeyCode.LeftControl,
@@ -3395,17 +2774,14 @@ local function buildPanel()
 		Diag = Window:AddTab({ Title = "Diagnostics", Icon = "activity" }),
 	}
 
-	-- Every control is registered with the state it is supposed to own. A button
-	-- that does nothing and a toggle wired to a key nobody reads look identical
-	-- from the outside, so the binding is recorded here and read back by
-	-- S.panelBindings() instead of being taken on trust.
+	-- Every control is registered with the state it owns and read back by S.panelBindings().
+	-- A toggle wired to a key nobody reads looks identical from the outside.
 	local bindings = {}
 	local function bind(id, element, get)
 		bindings[#bindings + 1] = { id = id, element = element, get = get }
 	end
 
-	-- A paragraph's text is written once by the library, so the live line lives in
-	-- the label underneath it and is rewritten by the refresh timer below.
+	-- A paragraph's text is written once, so the live line lives in the label underneath.
 	local statusParagraph = Tabs.Assist:AddParagraph({
 		Title = "Status",
 		Content = "",
@@ -3671,9 +3047,8 @@ local function buildPanel()
 					{
 						Title = "Unload",
 						Callback = function()
-							-- Deferred: this runs inside the library's own dialog
-							-- callback, and the unload destroys the library. Let the
-							-- dialog finish dismissing first, then tear down.
+							-- Deferred: this runs inside the library's own dialog callback, and unload destroys the
+							-- library.
 							task.defer(function()
 								if S.unload then
 									S.unload()
@@ -3689,12 +3064,10 @@ local function buildPanel()
 
 	Window:SelectTab(1)
 
-	-- A handle for diagnostics. The panel is part of the deliverable, so a report
-	-- must be able to read back what its controls are set to without clicking.
+	-- Handle for diagnostics, so a report can read back what the controls are set to.
 	S.panel = { lib = lib, window = Window, failed = nil, bindings = bindings }
 
-	-- Slow refresh, independent of the decision loop. 4 Hz is enough for a status
-	-- line and is 1/15th of the tick rate the catch path runs at.
+	-- Slow refresh, independent of the decision loop: 4 Hz against a 12 ms tick.
 	task.spawn(function()
 		while Fluent == lib and not lib.Unloaded do
 			local text = summaryText()
@@ -3734,23 +3107,16 @@ local function rotateTo(root, dir)
 		return
 	end
 
-	-- Snap, don't lerp: at point blank there is no time to interpolate through
-	-- the cone, and the server reads the replicated root at contact.
+	-- Snap, don't lerp: at point blank the server reads the replicated root at contact.
 	root.CFrame = CFrame.lookAt(root.Position, root.Position + incoming)
 	S.turns = S.turns + 1
 end
 
--- Movement impulse ------------------------------------------------------------
---
--- Every evasion that has to survive the movement controller uses this. A
--- `Humanoid:Move` write and a direct AssemblyLinearVelocity write are both
--- overwritten by the next WalkForce step - which is fine while the player stands
--- still and useless the moment a movement key is held, because then the
--- controller has an input to enforce and the assist has only a suggestion. The
--- game's own dash is a Plane LinearVelocity constraint and that is the mechanism
--- that actually holds, so it is the mechanism used here for the dash, the
--- sidestep and the juke alike. One slot per owner: a new impulse of the same kind
--- replaces the old one instead of stacking, and each carries its own lifetime.
+-- Movement impulse. A Humanoid:Move write and an AssemblyLinearVelocity write are both
+-- overwritten by the next WalkForce step - fine while the player stands still, useless the
+-- moment a key is held. The game's own dash is a Plane LinearVelocity constraint and that
+-- is the mechanism that holds, so every evasion uses one. One slot per owner: a new
+-- impulse replaces the old one and carries its own lifetime.
 local impulseSlots = {}
 
 local function stopImpulse(slot)
@@ -3801,23 +3167,17 @@ local function stopAllImpulses()
 	end
 end
 
--- The dash owns the body while its constraint is alive. Three Plane constraints
--- with the same MaxForce do not add, they argue, and the solver's answer is not
--- the dash's. Measured live over 52 dash frames: a sidestep impulse was alive
--- for 26 of them, and the dash travelled 0.02, 0.74, 3.66, 6.20 or 9.81 studs
--- depending on whether one overlapped and which way it pushed. One of those
--- dashes moved the body 3.17 studs backwards along its own axis. So every other
--- writer to the same plane stands down for the dash window, and the dash's
--- displacement stops being a property of the schedule.
+-- The dash owns the body while its constraint is alive. Overlapping Plane constraints do
+-- not add, they argue: measured over 52 dash frames, dashes travelled 0.02, 0.74, 3.66,
+-- 6.20 or 9.81 studs depending on the overlap, one of them 3.17 studs backwards.
 local function dashLive()
 	local velocity = S.dashVel
 	if not velocity then
 		return false
 	end
-	-- A constraint whose attachment has left the body is a corpse: the character
-	-- was destroyed mid-dash (death, respawn, teleport). Without this check the
-	-- handle stays non-nil and every sidestep and juke for the rest of the
-	-- session is refused by a dash that no longer exists.
+	-- A constraint whose attachment has left the body is a corpse - death, respawn, teleport.
+	-- Without this the handle stays non-nil and every later sidestep is refused by a dash
+	-- that no longer exists.
 	local attachment = S.dashAtt
 	if not attachment or not attachment.Parent then
 		S.dashVel = nil
@@ -3827,14 +3187,9 @@ local function dashLive()
 	return true
 end
 
--- Juke -----------------------------------------------------------------------
---
--- The hit test on every machine that is not the target's own leads the target by
--- half its flat velocity across the view delay plus half a ping
--- (ThrowFX.leadPos). On a 24 studs/s strafe at 70 ms ping that is ~2.3 studs of
--- forward lead, which is most of the capsule. Standing still or braking removes
--- that lead, so the prediction lands past the body instead of on it. This only
--- fires when a catch cannot happen anyway.
+-- The hit test leads the target by half its flat velocity across the view delay plus half
+-- a ping: at 24 studs/s and 70 ms that is ~2.3 studs, most of the capsule. Standing still
+-- removes that lead. Only fires when a catch cannot happen anyway.
 
 local function juke(character, root, dir, now)
 	if not CONFIG.juke then
@@ -3865,12 +3220,9 @@ local function juke(character, root, dir, now)
 		end
 	end
 
-	-- Kill the forward motion the hit test is extrapolating, then shove sideways.
-	-- The shove is a constraint rather than a velocity write for the same reason
-	-- the dash is: the WalkForce step rewrites AssemblyLinearVelocity from the
-	-- player's input on the next frame, so a write that works while standing still
-	-- does nothing at all while a key is held. The constraint overrides the input
-	-- for its own short life and then releases it.
+	-- Kill the forward motion the hit test extrapolates, then shove sideways. A constraint
+	-- rather than a velocity write for the same reason as the dash: WalkForce rewrites the
+	-- velocity from the player's input on the next frame.
 	if escape.Magnitude > 0.01 then
 		applyImpulse(root, "juke", escape.Unit, CONFIG.jukeSpeed, 0.12)
 	end
@@ -3880,12 +3232,9 @@ local function juke(character, root, dir, now)
 	return true
 end
 
--- Sustained sidestep. A juke is one shove; when the dash is still on its 2.2 s
--- cooldown there is no cooldown left to spend, so the remaining answer is to keep
--- walking out of the line for as long as the ball is closing. Humanoid:Move holds
--- against the movement controller every frame, and it costs nothing the hit test
--- can punish: the server leads by half our velocity, and half of 22 studs/s over
--- the last 0.3 s is 3.3 studs, which is inside the 8+ studs the sidestep covers.
+-- Sustained sidestep. A juke is one shove; with the dash on its 2.2 s cooldown the
+-- remaining answer is to keep walking out of the line. Humanoid:Move holds every frame
+-- and costs nothing the hit test can punish - half of 22 studs/s over 0.3 s is 3.3 studs.
 local function sidestep(character, root, dir, now, tti, off, ball)
 	if not CONFIG.sidestep or (now - S.lastSide) < 0.10 then
 		return false
@@ -3900,23 +3249,16 @@ local function sidestep(character, root, dir, now, tti, off, ball)
 		return false
 	end
 
-	-- Eliminated bodies do not step. `dodge` has always refused here, `canPress`
-	-- refuses here, and the sidestep did not - so while sidelined, walking to the
-	-- loose ball that re-enters the field, the assist kept taking the keyboard and
-	-- shoving the body off the pickup. The walk to that ball is the only movement
-	-- that matters in that state and nothing else is worth a step.
+	-- Eliminated bodies do not step. The walk to the re-entry ball is the only movement that
+	-- matters in that state, and the assist kept shoving the body off the pickup.
 	if character:GetAttribute(OUT_ATTR) == true then
 		S.sideOut = (S.sideOut or 0) + 1
 		return false
 	end
 
-	-- Movement input no longer refuses the sidestep. It used to: a key-down test
-	-- meant every evade was skipped the moment the player touched WASD, which is
-	-- exactly when a ball is hardest to see and the assist is most wanted. The
-	-- sidestep now rides the player's own drift instead of fighting it - the side
-	-- is chosen to agree with the current velocity below - and the hold is short
-	-- enough that it reads as the player stepping out of the line rather than the
-	-- assist taking the keyboard.
+	-- Movement input no longer refuses the sidestep. It used to, so every evade was skipped
+	-- the moment the player touched WASD - exactly when a ball is hardest to see. The step
+	-- now rides the player's own drift instead of fighting it.
 
 	local flatDir = dir and Vector3.new(dir.X, 0, dir.Z)
 	if not flatDir or flatDir.Magnitude < 0.01 then
@@ -3928,29 +3270,23 @@ local function sidestep(character, root, dir, now, tti, off, ball)
 		return false
 	end
 
-	-- Keep whatever side the body is already drifting toward, so two threats in a
-	-- row do not cancel each other out. Unless the predictor knows which side of
-	-- the ball's line the body is on - then the away side wins, because a step
-	-- toward the line has to cross it before it clears anything.
+	-- Keep the side the body is already drifting toward so two threats in a row do not cancel
+	-- out - unless the predictor knows which side of the line the body is on.
 	local vel = root.AssemblyLinearVelocity
 	local flatVel = Vector3.new(vel.X, 0, vel.Z)
 	local unit = side.Unit
 	local away = off and Vector3.new(off.X, 0, off.Z)
 	if away and away.Magnitude > 0.05 then
-		-- `off` is body-toward-line. The step is `-off`. The old test agreed the
-		-- unit WITH `off`, which walked the body into the ball's line: measured
-		-- live over 11 sidesteps, dot(sideDir, off) was positive on 8 and never
-		-- negative, and the misses it produced (0.82-2.36) all sat inside the
-		-- reach radius.
+		-- `off` is body-toward-line, so the step is `-off`. The old test agreed the unit WITH
+		-- `off`: measured over 11 sidesteps, dot(sideDir, off) was positive on 8 and never
+		-- negative, and every miss it produced sat inside the reach radius.
 		unit = -away.Unit
 	elseif flatVel.Magnitude > 1 and unit:Dot(flatVel) < 0 then
 		unit = -unit
 	end
 
-	-- One committed side per approach. `off` is recomputed every tick and swings
-	-- as the geometry moves; re-picking a side from it on every re-arm is what
-	-- made the body shuttle instead of stepping once. The first side chosen for
-	-- this ball holds until the ball changes or the commitment ages out.
+	-- One committed side per approach. `off` swings as the geometry moves, and re-picking a
+	-- side from it on every re-arm is what made the body shuttle instead of stepping once.
 	if ball and S.sideBall == ball and S.sideUnit and (now - (S.sideStamp or 0)) < 0.8 then
 		unit = S.sideUnit
 	else
@@ -3959,18 +3295,14 @@ local function sidestep(character, root, dir, now, tti, off, ball)
 		S.sideStamp = now
 	end
 
-	-- The hold. `Humanoid:Move` states the intent and keeps the animation honest;
-	-- the constraint is what actually travels while a movement key is held or the
-	-- auto-play agent is circling. Walk speed rather than dash speed: this is a
-	-- step out of the line, not a second dash, and the dash cooldown is the only
-	-- budget this assists spends on distance.
+	-- The hold. Humanoid:Move keeps the animation honest; the constraint is what travels
+	-- while a key is held. Walk speed, not dash speed - this is a step out of the line.
 	local hold = math.clamp((tti or 0.2) + 0.10, 0.14, 0.45)
 	local walk = humanoid.WalkSpeed > 0 and humanoid.WalkSpeed or 22
 	local speed = math.clamp(walk, 8, GameConfig.DODGE_SPEED or 64)
 
-	-- A step into a wall is not a step. Same probe as the dash, over the distance
-	-- this hold will actually cover, and the committed side follows whatever the
-	-- probe chose so a re-arm inside the hold does not flip back into the wall.
+	-- A step into a wall is not a step: same probe as the dash, over the distance this hold
+	-- will cover.
 	local probe = freeSide(character, root, unit, speed * hold)
 	if probe ~= unit then
 		unit = probe
@@ -3993,19 +3325,12 @@ local function sidestep(character, root, dir, now, tti, off, ball)
 	return true
 end
 
--- Dodge ----------------------------------------------------------------------
+-- Dodge. The catch judge refuses everything for 0.6 s after a catch lands, so the server's
+-- own DODGE_IFRAMES (0.26 s) is the only thing that stops a second ball.
 --
--- The catch judge refuses everything for 0.6 s after a catch lands, so a second
--- ball inside that window cannot be caught by anyone. The dodge action is the
--- game's answer: the server applies DODGE_IFRAMES (0.26 s) on receipt, which is
--- wider than the throw's own travel time at arena range.
---
--- The impulse is a Plane LinearVelocity constraint, exactly as DodgeInput.doDodge
--- builds it, not a one-shot AssemblyLinearVelocity write: the constraint holds
--- against the movement controller for the whole DODGE_TIME, so the dash is real
--- on every client that reads the replicated root. A direct velocity write is
--- cancelled by the next WalkForce step and the hit test then reads a stationary
--- target again.
+-- The impulse is a Plane LinearVelocity constraint exactly as DodgeInput.doDodge builds
+-- it, not a one-shot velocity write: the constraint holds against the movement controller
+-- for the whole DODGE_TIME, so the dash is real on every client that reads the root.
 
 local function dashStop()
 	local velocity = S.dashVel
@@ -4046,9 +3371,8 @@ local function dodge(character, root, now, ballDir, src, miss, off)
 		return false
 	end
 
-	-- doDodge's own gates. A dash fired outside a live round is refused by the
-	-- server and still burns nothing but the packet; the cooldown is only written
-	-- on receipt, so a refused dash would desync S.lastDodge from the game's.
+	-- doDodge's own gate: a dash outside a live round is refused and would desync
+	-- S.lastDodge from the game's.
 	if LocalPlayer:GetAttribute("InMatch") ~= true then
 		why.inmatch = (why.inmatch or 0) + 1
 		return false
@@ -4068,10 +3392,9 @@ local function dodge(character, root, now, ballDir, src, miss, off)
 		return false
 	end
 
-	-- The server publishes the dash cooldown on both the player and the
-	-- character. A dash inside that window is refused and grants no i-frames, so
-	-- it is not worth the packet, and it must not write S.lastDodge either: that
-	-- is the only record of a dash the server actually accepted.
+	-- The server publishes the dash cooldown on both the player and the character. A dash
+	-- inside it grants no i-frames and must not write S.lastDodge - that is the only record
+	-- of a dash the server actually accepted.
 	local dashReady = readyAt(character, "DashReadyAt")
 	if dashReady and now < dashReady and dashReady < now + 10 then
 		S.dashRefused = (S.dashRefused or 0) + 1
@@ -4079,10 +3402,8 @@ local function dodge(character, root, now, ballDir, src, miss, off)
 		return false
 	end
 
-	-- Local record of the last dash the server accepted. The published cooldown
-	-- above should already cover this; a refusal here means S.lastDodge and the
-	-- attribute have drifted, which is a separate fault from a dash on cooldown
-	-- and gets its own counter.
+	-- Local record of the last accepted dash. A refusal here means it drifted from the
+	-- published attribute, which is its own counter.
 	if (now - S.lastDodge) < (GameConfig.DODGE_COOLDOWN or 2.2) then
 		why.cadence = (why.cadence or 0) + 1
 		return false
@@ -4092,15 +3413,10 @@ local function dodge(character, root, now, ballDir, src, miss, off)
 	local run = Vector3.new(vel.X, 0, vel.Z)
 	local dir
 
-	-- Sideways across the ball line beats straight back: it also slides out from
-	-- under the hit test's own velocity lead, and it costs less distance.
-	--
-	-- Which side is not a matter of taste. The predictor already computes the
-	-- body's perpendicular offset at closest approach (`off`); stepping along it
-	-- adds to that offset, and stepping against it has to cross the line before
-	-- it clears anything - a dash that travels ten studs and ends up on the ball's
-	-- path. The body's own drift is only the tie-break, for the case where the
-	-- body is exactly on the line and both sides are equally good.
+	-- Sideways across the ball line beats straight back: it also slides out from under the
+	-- hit test's velocity lead. `off` is body-toward-line, so the dash goes along `-off` -
+	-- stepping along `off` has to cross the line before it clears anything. The body's drift
+	-- is only the tie-break.
 	local flat = ballDir and Vector3.new(ballDir.X, 0, ballDir.Z)
 	if flat and flat.Magnitude > 0.01 then
 		local side = flat.Unit:Cross(Vector3.new(0, 1, 0))
@@ -4108,11 +3424,8 @@ local function dodge(character, root, now, ballDir, src, miss, off)
 			dir = side.Unit
 			local away = off and Vector3.new(off.X, 0, off.Z)
 			if away and away.Magnitude > 0.05 then
-				-- `off` is body-toward-line, so the dash goes along `-off`. The old
-				-- sign agreed the dash WITH `off`: measured live at miss=0.97 the
-				-- dash owed 2.03, crossed the line and finished 1.06 studs on the
-				-- far side, still inside the 2.4 reach radius - a dash that spent
-				-- its whole budget to arrive closer to the ball.
+				-- The old sign agreed the dash WITH `off`: measured at miss=0.97, it owed 2.03, crossed
+				-- the line and finished 1.06 studs on the far side, still inside the reach radius.
 				dir = -away.Unit
 			elseif run.Magnitude > 1 and dir:Dot(run) < 0 then
 				dir = -dir
@@ -4134,12 +3447,8 @@ local function dodge(character, root, now, ballDir, src, miss, off)
 	local unit = dir.Unit
 	local speed = GameConfig.DODGE_SPEED or 64
 
-	-- How far this dash has to travel is a property of the ball in front of it,
-	-- not of the action. `miss` is the centre-to-centre distance the tracker
-	-- predicts at closest approach, so the distance still owed is whatever it
-	-- takes to reach the catch radius plus margin, corrected for the drift the
-	-- dash is about to take away. A dash that only has to step half a stud should
-	-- not spend ten, and a dash that has to step eight should not stop at four.
+	-- How far the dash travels is a property of the ball: the distance to clear the reach
+	-- radius plus margin, corrected for the drift the dash takes away.
 	local need = dashOwed(miss, off, run, speed)
 
 	local target = math.max(need, DODGE_MIN_TRAVEL)
@@ -4148,15 +3457,11 @@ local function dodge(character, root, now, ballDir, src, miss, off)
 		target = cap
 	end
 
-	-- The side is only worth taking if the floor is there to take it. Probe both
-	-- before the anim is picked, so the animation matches the direction the body
-	-- actually travels.
+	-- Probe both sides before the anim is picked, so the animation matches the direction the
+	-- body actually travels.
 	local probe, room = freeSide(character, root, unit, target)
 	if room and room < DODGE_MIN_TRAVEL * 0.4 then
-		-- Both sides closed. Spending the 2.2 s cooldown on a dash that can move a
-		-- tenth of a stud is strictly worse than keeping it: measured live, one such
-		-- dash ran its full life and finished 0.03 studs *behind* its own axis,
-		-- pushed back by the same geometry it was aimed at.
+		-- Both sides closed: keeping the 2.2 s cooldown beats a dash that moves 0.03 studs.
 		S.dashNoRoom = (S.dashNoRoom or 0) + 1
 		return false
 	end
@@ -4199,28 +3504,18 @@ local function dodge(character, root, now, ballDir, src, miss, off)
 	S.dashSrc = src
 	S.dashVel0 = run
 
-	-- Distance-gated, not time-gated. `task.delay(DODGE_TIME)` tore the
-	-- constraint down on the wall clock, so the last frame contributed whatever
-	-- the frame happened to be: at 30 fps the dash lost up to a stud, at 144 fps
-	-- it gained one, and a hitch could land it anywhere in between. The gate below
-	-- reads the body's own position and trims the final frame's speed so the
-	-- total lands on `target` whatever the frame rate was.
+	-- Distance-gated, not time-gated. A wall-clock tear-down lost up to a stud at 30 fps and
+	-- gained one at 144; the gate reads the body's own position and trims the final frame.
 	--
-	-- The landing is the handback. The constraint forced the whole plane to the
-	-- dash velocity, which erased whatever the player's key was doing, so the
-	-- held direction is restated here - in the same function that releases the
-	-- constraint - instead of waiting for the movement controller to notice on
-	-- its own. No key means the dash's own momentum goes, which is the landing
-	-- the game gives the action.
+	-- The landing is the handback: the constraint erased whatever the key was doing, so the
+	-- held direction is restated in the same function that releases it.
 	local startPos = root.Position
 	local travelled = 0
 	local elapsed = 0
 	local landed = false
 
-	-- Both of these are written by the per-frame gate and read by `land()`, so
-	-- they have to be declared before it. A local declared below a closure is a
-	-- global inside it, and the read then reports nil for a dash that stopped
-	-- perfectly well - which is the one number this instrumentation exists for.
+	-- Both are written by the per-frame gate and read by land(), so they must be declared
+	-- before it: a local declared below a closure is a global inside it and reads nil.
 	local stopWhy = "gone"
 	local frames = 0
 
@@ -4284,11 +3579,8 @@ local function dodge(character, root, now, ballDir, src, miss, off)
 		local d = root.Position - startPos
 		travelled = Vector3.new(d.X, 0, d.Z):Dot(unit)
 
-		-- Flight recorder. A dash that spends its whole life and moves a
-		-- centimetre is indistinguishable from a dash that never got a
-		-- constraint unless the per-frame facts are kept: is the handle still
-		-- ours, is the constraint still parented, what is it asking for, and
-		-- how fast does the body actually think it is going.
+		-- Flight recorder: is the handle still ours, is the constraint still parented, what is it
+		-- asking for, and how fast does the body think it is going.
 		do
 			local log = S.dashLog
 			local flatV = root.AssemblyLinearVelocity
@@ -4341,24 +3633,17 @@ local function dodge(character, root, now, ballDir, src, miss, off)
 	return true
 end
 
--- Evade -----------------------------------------------------------------------
---
--- Single entry point for every branch where catching cannot happen before the
--- ball arrives. The dash is the only thing that actually stops the hit (server
--- i-frames), so it is spent first at dodgeLead; the brake catches whatever the
--- dash cooldown leaves uncovered, and it is free.
+-- Single entry point for every branch where catching cannot happen before the ball
+-- arrives. The dash is the only thing that stops the hit, so it is spent first.
 
 local function evade(character, root, dir, now, tti, src, sideAt, miss, off, ball)
 	if not S.enabled or not tti then
 		return false
 	end
 
-	-- Decision recorder. A death row says which lane armed the body but not what
-	-- the body did or why it declined, and the last death that mattered was a
-	-- ball answered `hit` at 0.128 s with a 2.37 stud miss - inside the catch
-	-- radius, inside nothing else - that took a life with no dash and no stamp.
-	-- Without the branch name that is indistinguishable from evade never being
-	-- called at all.
+	-- Decision recorder. A death row says which lane armed the body but not why it declined -
+	-- and a hit answered `hit` at 0.128 s with a 2.37 stud miss looked identical to evade
+	-- never being called.
 	local why = S.evadeWhy
 	local function note(branch, extra)
 		why[branch] = (why[branch] or 0) + 1
@@ -4377,33 +3662,21 @@ local function evade(character, root, dir, now, tti, src, sideAt, miss, off, bal
 		)
 	end
 
-	-- Armed on capability, not on a fixed lead. A dash can still clear a ball as
-	-- long as the distance it owes, divided by dash speed, fits inside the time
-	-- left - `tti >= owed / speed`. The old fixed lead fired too late on a fast
-	-- ball: measured live at tca 0.053 on a 140 studs/s throw, where a dash could
-	-- cover 3.4 of the 5.3 studs it still owed, and the ball arrived inside the
-	-- reach radius. It also fired too early on slow ones, spending a 2.2 s
-	-- cooldown on a ball that was not arriving yet.
+	-- Armed on capability, not a fixed lead: tti >= owed / speed. A fixed lead fired too late
+	-- on a 140 studs/s throw (tca 0.053, 3.4 of 5.3 studs owed) and too early on slow ones.
 	local speed = GameConfig.DODGE_SPEED or 64
 	local owed = dashOwed(miss, off, root.AssemblyLinearVelocity, speed)
 	local lead = math.max(CONFIG.dodgeLead, owed / speed + 0.02)
 	local leadTxt = string.format("lead=%.2f owed=%.2f", lead, owed)
 
 	if tti <= lead then
-		-- A handout is a ball thrown AT this body to be caught, not a ball being
-		-- thrown at it to be dodged. Spending the 2.2 s dash cooldown on one is
-		-- spending it on the wrong ball: measured over six runs, `pass`-class
-		-- entries burned 8 of 21 dashes, and the same runs lost 3 lives in the
-		-- one busy round. A handout still gets the free sidestep below, because
-		-- a mislabelled pass that is genuinely inbound must not be ignored.
+		-- A handout is a ball thrown AT this body to be caught, not at it to be dodged. Gating on
+		-- `kind == pass` stopped 8 of 21 dashes being burned on handouts; the free sidestep below
+		-- still covers a mislabelled inbound pass.
 		--
-		-- The test is `kind` and nothing else. `isHandout` also accepts
-		-- `passTarget`/`handout`, and those are populated on ordinary attack
-		-- entries too: gating on the full predicate dropped attack-class dashes
-		-- from 19 to 2 in one batch, and the batch after it lost 12 lives where
-		-- the one before lost 3 - the clearest evidence in this file that the
-		-- dash is what saves the life. `kind` is the marker ThrowFX sets for a
-		-- pass and it is the only one that distinguishes the two populations.
+		-- The test is `kind` and nothing else. isHandout also accepts passTarget/handout, which
+		-- are populated on ordinary attack entries too: gating on it dropped attack dashes from
+		-- 19 to 2 and lives rose from 3 to 12 in the batch after.
 		if ball and ball.kind == "pass" then
 			note("dash-handout", leadTxt)
 		elseif dodge(character, root, now, dir, src, miss, off) then
@@ -4414,20 +3687,13 @@ local function evade(character, root, dir, now, tti, src, sideAt, miss, off, bal
 		end
 	end
 
-	-- The dash is unavailable, either because the server's cooldown is still
-	-- running or because this ball is not close enough to spend it on yet. Walk
-	-- out of the line for as long as the ball stays inbound.
-	--
-	-- A step already in flight owns the body until its hold ends. Without this
-	-- the 0.10 s re-arm fired two or three times inside one 0.14-0.45 s hold,
-	-- restarting the same impulse each time - that is the shove that reads as
-	-- "keeps pushing me", and on the path lane it ran for the whole flight.
+	-- The dash is unavailable, so walk out of the line for as long as the ball stays inbound.
+	-- A step already in flight owns the body until its hold ends: without this the 0.10 s
+	-- re-arm fired two or three times inside one hold, which is the shove that reads as
+	-- "keeps pushing me".
 	if S.sidestepUntil and now < S.sidestepUntil then
 		edge("holdBlock")
-		-- ...but only for the ball the step was taken for. The hold is a body
-		-- lock, not a threat lock: a second ball arriving sooner than this one
-		-- used to get nothing at all for the rest of the hold, which is a
-		-- quarter of a second of standing still with a live ball inbound.
+		-- A body lock, not a threat lock: a second ball arriving sooner still has to be answered.
 		if ball and S.sideBall and ball ~= S.sideBall then
 			edge("starve")
 			note("hold-other", leadTxt)
@@ -4437,10 +3703,8 @@ local function evade(character, root, dir, now, tti, src, sideAt, miss, off, bal
 		return true
 	end
 
-	-- Armed on the distance the step owes, not on a fixed lead. At walk speed the
-	-- body needs `owed / walk` seconds to clear; `sideAt` used to be the full
-	-- 1.0 s horizon on the path lane, which armed the step a whole second out and
-	-- then kept re-arming it for the entire approach.
+	-- Armed on the distance the step owes, not a fixed lead: the full 1.0 s horizon armed the
+	-- step a second out and kept re-arming it for the whole approach.
 	local walk = 22
 	local leadSide = sideAt
 		or math.clamp(dashOwed(miss, off, root.AssemblyLinearVelocity, walk) / walk + 0.08, 0.14, 0.5)
@@ -4460,20 +3724,10 @@ local function evade(character, root, dir, now, tti, src, sideAt, miss, off, bal
 	return false
 end
 
--- Dodge sizing for the decide() lane. `decide()` returns an arrival time, not a
--- miss, so a dash fired from that lane has no geometry of its own and would fall
--- back to a fixed three studs. The physical threat read each tick does know the
--- miss, and it is cached where it is read; this hands it over only when the
--- cached ball is the one being dodged, so a dash never inherits another ball's
--- numbers.
---
--- The physical read runs after the catch block, so on the tick a dash fires the
--- cache describes the previous tick, and only when that read happened to pick
--- this ball. When it did not, the geometry is read again from the same
--- `pathThreat` the physical answer uses - same sample, same capsule radius,
--- same perpendicular. The alternative is a fixed-length dash whose side was
--- chosen by the body's drift, which is how a dash ends up stepping into the
--- line it was meant to leave.
+-- Dodge sizing for the decide() lane. decide() returns an arrival time, not a miss, so the
+-- geometry is taken from the same pathThreat the physical answer uses, and only when the
+-- cached ball is the one being dodged. The alternative is a fixed-length dash whose side
+-- was chosen by drift - which is how a dash steps into the line it meant to leave.
 local function dashGeom(state, character, root, now)
 	if not state then
 		return nil, nil
@@ -4502,9 +3756,8 @@ end
 -- Anything this close is a contact problem, not a trajectory problem.
 local NEAR_RADIUS = 14
 
--- One line describing the last ball that got inside NEAR_RADIUS. The flags are
--- what decide() gates on, so a death reads as "the ball was there and the gate
--- refused it" or "the ball was never there at all" instead of a guess.
+-- One line describing the last ball inside NEAR_RADIUS, so a death reads as "the gate
+-- refused it" or "the ball was never there".
 local function nearText(now)
 	local n = S.nearNow
 	if not n then
@@ -4539,14 +3792,8 @@ local function nearText(now)
 	)
 end
 
--- Frame budget ----------------------------------------------------------------
---
--- Two numbers decide whether an answer can be late for reasons that have nothing
--- to do with the ball: the frame delta, which is the game's own hitch, and this
--- script's per-tick cost, which is ours. Both are kept as short rings so a report
--- can say "our tick costs 0.4 ms at p99 while the frame hitches to 90 ms" instead
--- of leaving it to a story. Nothing here changes behaviour; it is the measurement
--- the correctness argument rests on.
+-- Frame budget: the frame delta is the game's own hitch, the per-tick cost is ours. Kept
+-- as short rings so a report can state both as numbers.
 local FRAME_RING = 600
 
 local function ringPush(ring, key, value)
@@ -4632,23 +3879,18 @@ local function step()
 		return
 	end
 
-	-- Assist movement authority. Two controllers want the body: this assist's
-	-- sidestep and the auto-play agent's circling. `Humanoid:Move` is one slot, so
-	-- whoever writes last wins - and the agent writes from its own 20 Hz loop. A
-	-- sidestep issued once and then overwritten 50 ms later moves for one frame in
-	-- three, which is not enough lateral travel to leave a 2.4 stud catch radius
-	-- once the hit test's own velocity lead is subtracted. While a sidestep is
-	-- live this holds the direction every tick; the agent yields below.
+	-- Assist movement authority. Humanoid:Move is one slot and the auto-play agent writes it
+	-- from its own 20 Hz loop, so a step issued once moves one frame in three - not enough
+	-- lateral travel to leave the catch radius. While a sidestep is live this holds the
+	-- direction every tick.
 	local sideDir = S.sideDir
 	if S.sidestepUntil then
 		local clock = Workspace:GetServerTimeNow()
 		if clock < S.sidestepUntil and sideDir then
 			humanoid:Move(sideDir, false)
 		else
-			-- What the sidestep actually bought, in studs of lateral travel. A
-			-- sidestep that competes with another movement writer measures near
-			-- zero here however many times it was issued, which is why this is a
-			-- distance and not a call count.
+			-- What the sidestep actually bought, in studs: a step competing with another writer
+			-- measures near zero however many times it was issued.
 			local from = S.sideFrom
 			if from and root then
 				local flat = root.Position - from
@@ -4662,8 +3904,6 @@ local function step()
 			S.sideDir = nil
 			stopImpulse("side")
 			-- Only stand the body down if the player is not asking it to move.
-			-- `Move(zero)` here used to erase a held key for a frame, which reads
-			-- as a stutter at exactly the moment the sidestep ended.
 			local held = humanoid.MoveDirection
 			if Vector3.new(held.X, 0, held.Z).Magnitude <= 0.1 then
 				humanoid:Move(Vector3.zero, false)
@@ -4689,15 +3929,12 @@ local function step()
 		body = Ballistics.Body(character)
 		bodyCache[character] = body
 	end
-	-- The exact volume the hit test uses, refreshed every tick. The dodge audit
-	-- runs the game's own BodyHit against it rather than a hand-rolled distance,
-	-- because the volume is an anisotropic capsule and a horizontal clearance
-	-- says nothing about whether a ball at head height went through it.
+	-- The exact volume the hit test uses, refreshed every tick: the volume is an anisotropic
+	-- capsule, and a horizontal clearance says nothing about a ball at head height.
 	S.lastBody = body
 
-	-- The replicated ball state for this tick, read once. The physical tracker
-	-- needs it now rather than below: `state.lag` is how far behind the drawn
-	-- part is, and that number belongs on the sample the tracker stores.
+	-- Read once. `state.lag` is how far behind the drawn part is, and that belongs on the
+	-- sample the tracker stores.
 	local live = ThrowFX.Live()
 
 	-- Physical ball track. Runs before any predictor so every one of them reads a
@@ -4710,14 +3947,12 @@ local function step()
 	reconcileThrow(character, now)
 	watchPalm(character, now)
 
-	-- Shared tick counter. Every live copy of this script bumps the same global,
-	-- so its rate proves how many copies are actually running: one instance at a
-	-- 12 ms tick reads ~83/s, a stacked duplicate reads ~166/s.
+	-- Shared tick counter: every live copy bumps the same global, so its rate proves how many
+	-- copies are running - one instance at 12 ms reads ~83/s.
 	getgenv().__acTicks = (getgenv().__acTicks or 0) + 1
 
-	-- Eliminated: the only ball that matters is a teammate's pass, and dodging one
-	-- costs the ride back onto the field. Drop passes from the threat set instead
-	-- of moving out from under them.
+	-- Eliminated: the only ball that matters is a teammate's pass, and dodging one costs the
+	-- ride back onto the field.
 	local out = isEliminated()
 
 	-- While eliminated, a teammate's pass is the route back onto the field, not a
@@ -4733,12 +3968,10 @@ local function step()
 		end
 	end
 
-	-- Near-ball record ---------------------------------------------------------
-	-- Everything the predictor can reason about lives on `state.seg`. A ball with
-	-- no segment - unarmed this tick, or already dropped by ThrowFX while still
-	-- in the air - is invisible to decide() and to the point-blank net under it.
-	-- That is exactly the shape of a close-range hit, so the nearest ball's own
-	-- numbers are kept every tick and read back when a life drops.
+	-- Near-ball record. Everything the predictor reasons about lives on `state.seg`, and a
+	-- ball with no segment - unarmed, or already dropped by ThrowFX while still in the air -
+	-- is invisible to decide() and to the point-blank net. That is the shape of a close-range
+	-- hit, so the nearest ball's numbers are kept every tick and read back on a death.
 	local nearBall, nearDist, nearTti = nil, math.huge, nil
 	local present = setmetatable({}, { __mode = "k" })
 
@@ -4783,10 +4016,8 @@ local function step()
 		end
 	end
 
-	-- The ball watched last tick is gone from Live() while it was already inside
-	-- the near radius. It has not gone anywhere; ThrowFX has stopped predicting
-	-- it. Counting that is how "never saw the ball" is separated from "saw it and
-	-- every answer was gated".
+	-- The watched ball left Live() while already inside the near radius: ThrowFX stopped
+	-- predicting it, it did not go anywhere.
 	if S.watchBall and not present[S.watchBall] and S.watchInfo then
 		S.lostAt = now
 		S.lostInfo = S.watchInfo
@@ -4826,25 +4057,16 @@ local function step()
 		S.classLast[classOf(best)] = now
 	end
 
-	-- The old contact press lived here: a "decide() missed it but a fast ball is
-	-- inside reach" branch. It never fired once in 25 623 frames, because the two
-	-- conditions cannot coincide - a ball close enough to be contact still carries
-	-- a segment, and any segment predicting a hit is already returned by decide().
-	-- The raw closest-approach net below covers the real gap (balls no predictor
-	-- will answer for), so the branch is gone rather than lying in the counters.
+	-- The old contact press lived here and never fired once in 25 623 frames: a ball close
+	-- enough to be contact still carries a segment, and any segment predicting a hit is
+	-- already returned by decide(). The raw net below covers the real gap.
 
-	-- The physical threat is read every tick, before the gate. It is the body's
-	-- input, and it is also the only number that proves the ball was seen at all:
-	-- reading it inside the gate would make "the catch already had it" and "the
-	-- ball was never detected" report the same way, and those are different faults.
+	-- The physical threat is read every tick, before the gate. Reading it inside the gate
+	-- would make "the catch had it" and "the ball was never detected" report the same way.
 	--
-	-- Read here, above the contact clock, not after it. The catch schedule used to
-	-- be driven only by decide()'s answer while the body lane read this one, so a
-	-- ball that only the segment lane could see produced exactly the sequence the
-	-- flight recorder captured on a lost life: `hit@seg d=3.6 tca=0.024 miss=1.93`
-	-- three ticks running, and a death row reading `ball=nil tti=-`. One predictor
-	-- answered, the other never heard it, and the press schedule listens to the
-	-- second one. Both are now the same clock.
+	-- Read above the contact clock, not after it: a ball only the segment lane could see used
+	-- to publish `hit@seg d=3.6 tca=0.024` for three ticks while the death row read
+	-- `ball=nil tti=-`. Both lanes now feed one clock.
 	local phTti, phDir, phMiss, phPart, phState, phOff = physicalThreat(character, root, now, CONFIG.horizon, exempt, live)
 	S.lastPhysicalTti = phTti
 	S.lastPhysicalMiss = phMiss
@@ -4863,11 +4085,8 @@ local function step()
 		end
 	end
 
-	-- Raw fallback. Anything the segment predictor refused to answer for - a pass,
-	-- a ball that has already come off the world, a segment ThrowFX stopped
-	-- advancing - still lands, and the last fraction of a second is a straight
-	-- line. Computed before the history so a death snapshot shows it, and spent
-	-- after the catch decision so it never competes with a catchable ball.
+	-- Raw fallback for anything the segment predictor refused - a pass, a ball off the world,
+	-- a segment ThrowFX stopped advancing. Computed before the history, spent after the catch.
 	local rawTti, rawDir = nil, nil
 	if not tti and not phTti then
 		rawTti, rawDir = rawThreat(live, character, root, now)
@@ -4887,9 +4106,8 @@ local function step()
 		edge("tick")
 	end
 
-	-- Per-frame threat history. Sampled at quarter rate so forty rows hold the
-	-- ~2.5 s a hit is actually decided in, and written as text so a snapshot can
-	-- be carried out of the game without a serialiser.
+	-- Per-frame threat history at quarter rate: forty rows hold the ~2.5 s a hit is decided
+	-- in, written as text so a snapshot needs no serialiser.
 	S.histClock = S.histClock + 1
 	if S.histClock % 4 == 0 then
 		local hist = S.hist
@@ -4899,10 +4117,9 @@ local function step()
 		local catchReady = readyAt(character, "CatchReadyAt")
 		local dashReady = readyAt(character, "DashReadyAt")
 
-		-- Whether the predictor had a usable record for the ball the game calls
-		-- nearest, and what that record answered. Without this the history shows a
-		-- ball 1.2 studs away and a body that did nothing, with no way to tell
-		-- "never sampled" from "sampled and refused".
+		-- Whether the predictor had a record for the ball the game calls nearest, and what it
+		-- answered: without it the history shows a ball 1.2 studs away and a body that did
+		-- nothing, with no way to tell never-sampled from sampled-and-refused.
 		local nearKey = nearBall and (nearBall.part or nearBall) or nil
 		local nearRec = nearKey and segPath[nearKey] or nil
 		local nearRecText = "-"
@@ -4943,19 +4160,12 @@ local function step()
 		)
 	end
 
-	-- Contact clock. ThrowFX drops a ball from Live() the instant it resolves, so
-	-- the last few frames before impact frequently have no segment left to
-	-- predict from — and that gap is exactly where the catch is decided. Holding
-	-- the contact time keeps the press schedule running through it.
+	-- Contact clock. ThrowFX drops a ball from Live() the instant it resolves, so the last
+	-- frames before impact often have no segment - and that gap is where the catch is decided.
 	--
-	-- The segment answer and the physical answer are two views of the same ball,
-	-- and only one of them used to reach this clock. `decide()` runs the segment
-	-- predictor over Live(); `physicalThreat` runs the part tracker and the
-	-- segment lane under it, and on a real lost life the second one answered
-	-- (`hit@seg d=3.6 tca=0.024 miss=1.93`, three ticks in a row) while the death
-	-- row read `ball=nil tti=-` and no press was ever scheduled. Whichever
-	-- answers soonest is the ball that is about to arrive, so the clock takes the
-	-- sooner of the two and both lanes feed one schedule.
+	-- The segment and physical lanes are two views of the same ball and only one used to
+	-- reach this clock. Whichever answers soonest is the ball about to arrive, so the clock
+	-- takes the sooner of the two and both lanes feed one schedule.
 	local clockTti, clockBall, clockDir = tti, best, dir
 	if phTti and (not clockTti or phTti < clockTti) then
 		clockTti = phTti
@@ -4976,31 +4186,24 @@ local function step()
 		effTti = S.contactAt - now
 	end
 
-	-- The bearing the clock is running on. `judgePress` and the facing turn read
-	-- this one, and a physical-lane answer carries its own: without it the press
-	-- is scheduled for a ball the body is not looking at, which the judge refuses
-	-- on the cone alone.
+	-- The bearing the clock runs on: judgePress and the facing turn read it, and a physical
+	-- answer carries its own. Without it the press is scheduled for a ball the body is not
+	-- looking at, which the judge refuses on the cone alone.
 	if not dir and clockDir then
 		dir = clockDir
 	end
 
-	-- The cone is judged against this ball's own approach. A direction left over
-	-- from the previous ball is worse than no direction at all: it can read as
-	-- "facing away" and spend a dash on a catch that was available.
+	-- A direction left over from the previous ball can read as "facing away" and spend a dash
+	-- on a catch that was available.
 	local key = best or S.contactBall
 	local effDir = dir
 	if not effDir and S.lastDirBall == key then
 		effDir = S.lastDir
 	end
 
-	-- Arming horizon. A stamp is only worth sending if it is still inside the
-	-- judge window when the ball is judged, so the schedule opens a full window
-	-- before contact rather than at a shorter lead. The gap this closes is the
-	-- point-blank one: a ball first seen inside the old lead, or one that arrives
-	-- sooner than the prediction said, had no stamp armed at all and the only
-	-- answer left was a dash on a 2.2 s cooldown. The refresh below keeps the
-	-- newest stamp young; the early arm is insurance, and insurance is free
-	-- because a refused press does not arm CatchReadyAt.
+	-- Arming horizon: a stamp is only worth sending if it is still inside the judge window at
+	-- contact, so the schedule opens a full window early. Insurance is free - a refused press
+	-- does not arm CatchReadyAt. The refresh below keeps the newest stamp young.
 	local window = catchWindow(character)
 	local armHorizon = math.max(CONFIG.pressLead, window - CONFIG.pressBias)
 
@@ -5048,18 +4251,9 @@ local function step()
 	S.lastReason = reason
 	edge("cap_" .. tostring(reason))
 
-	-- Contact audit. One row per ball, written the first tick the contact clock
-	-- reaches zero: would the judge have accepted the catch on the ball that just
-	-- arrived? Read here, where `S.contactAt` and `S.pressStamp` are both
-	-- authoritative. The history ring reads a decaying copy of the contact clock,
-	-- so it reports a gap on every frame of a ball it never actually saw arrive;
-	-- this cannot, and it fires once per ball instead of once per tick.
-	--
-	-- The answer is `catchCovers` - the same predicate the fallback uses to decide
-	-- whether to spend a dash - so the audit can never disagree with the decision
-	-- it is auditing. `covered` means the catch should have landed; `late` means a
-	-- stamp existed but the clock had moved past it; `nostamp` means no press at
-	-- all, which is the hands or the round, not the schedule.
+	-- Contact audit, once per ball at contact: would the judge have accepted a catch on the
+	-- ball that just arrived? `catchCovers` is the same predicate the fallback uses, so the
+	-- audit cannot disagree with the decision it audits. covered / late / nostamp.
 	local auditBall = best or S.contactBall
 	if effTti and effTti <= 0 and auditBall and S.contactLogged ~= auditBall then
 		S.contactLogged = auditBall
@@ -5071,13 +4265,9 @@ local function step()
 			catchReadyNow,
 			S.refusedBall == auditBall
 		)
-		-- `late` has to mean a press that missed the band, not a stamp left lying
-		-- around from a previous ball. The stamp is never cleared, so a naive
-		-- "stamp exists" test labels a ball that was never pressed for as late by
-		-- however long the round has been running - measured at up to 14.7 s. That
-		-- reads as a schedule a few frames behind when the truth is no press at
-		-- all, which is a different fault with a different repair. Anything older
-		-- than a second past the window is no press.
+		-- `late` has to mean a press that missed the band, not a stamp left over from an earlier
+		-- ball. The stamp is never cleared, so a naive test labelled a ball that was never pressed
+		-- for as late by however long the round had run - measured at 14.7 s.
 		local stampAge = (S.contactAt and S.pressStamp) and (S.contactAt - S.pressStamp) or nil
 		local verdict = contactVerdict(covered, stampAge, window)
 
@@ -5088,12 +4278,8 @@ local function step()
 		tallyClass(classOf(auditBall), "contact")
 		tallyClass(classOf(auditBall), verdict)
 
-		-- How late is late. `late` on every contact is a schedule that arrives
-		-- after the ball, and the size of the gap decides which repair is right:
-		-- tens of milliseconds is a refresh that fires one frame too early,
-		-- hundreds is a press aimed at a different ball. Recorded per class
-		-- because the whole question is whether one population is systematically
-		-- closer to the edge than the other.
+		-- How late is late: tens of milliseconds is a refresh one frame early, hundreds is a press
+		-- aimed at a different ball.
 		if S.contactAt and S.pressStamp then
 			local age = S.contactAt - S.pressStamp
 			local kind = classOf(auditBall)
@@ -5162,10 +4348,8 @@ local function step()
 		end
 	end
 
-	-- Raw contacts. The predictor had no segment for this ball, so the schedule
-	-- could not arm it and the body is the only answer. Counted separately: a
-	-- point-blank hit that came in without a segment must read as exactly that in
-	-- the log, not hide behind the segment audit above.
+	-- Raw contacts: no segment, so the schedule could not arm it and the body is the only
+	-- answer. Counted apart so a point-blank hit reads as exactly that.
 	if rawTti and rawTti <= 0 then
 		if not S.rawContact then
 			S.rawContact = true
@@ -5185,30 +4369,18 @@ local function step()
 		S.rawContact = false
 	end
 
-	-- Death log. Lives dropping is not the same question as a hit landing, and
-	-- treating them as one is why every recorded "death" in this session read
-	-- `taken=+0 outs=+0` with no ball inbound: the game shifts `Lives` on round
-	-- state (prison, elimination, round start) as well as on damage. Measured at
-	-- the end of a batch of three life drops: `HitsTaken=1`, `HitImpactUndone=1`,
-	-- `MatchOuts=2` - two hits total for three drops, so at least one drop was a
-	-- round shift. This comment used to claim the opposite.
+	-- Death log. Lives dropping is not the same question as a hit landing: the game shifts
+	-- Lives on round state (prison, elimination, round start) as well as on damage. Measured
+	-- over three drops: HitsTaken=1, HitImpactUndone=1, MatchOuts=2 - two hits for three
+	-- drops, so at least one was a round shift.
 	--
-	-- There is also no `HitNotSeen` attribute on this game's player - read on a
-	-- live client, the only hit counters that exist are `HitsTaken`,
-	-- `HitImpactUndone` and `HitThrows`. The `unseen=+0` column was therefore
-	-- reading a missing attribute on every row and always printing zero, which
-	-- made "the server resolved a hit we never drew" look disproven when it had
-	-- never been measured at all.
-	--
-	-- So: `taken` (HitsTaken delta) is the only column that means damage. A drop
-	-- with no delta is tagged `shift` and is not counted as a hit.
+	-- There is no HitNotSeen attribute on this game's player; the counters that exist are
+	-- HitsTaken, HitImpactUndone and HitThrows. `taken` (HitsTaken delta) is the only column
+	-- that means damage, and a drop with no delta is tagged `shift`.
 	local lives = tonumber(LocalPlayer:GetAttribute("Lives"))
 	local hitsTaken = tonumber(LocalPlayer:GetAttribute("HitsTaken"))
-	-- Prime the deltas on the first tick that has a value. `HitsTaken` is a
-	-- persistent player attribute - it read 1 on a freshly joined server, before
-	-- this client had been hit once - so a delta taken against a nil snapshot is
-	-- zero, and the load's first real hit is tagged `shift`. That is the whole
-	-- reason every row in this session read `taken=+0`.
+	-- Prime the deltas on the first tick with a value: HitsTaken is persistent - it read 1 on
+	-- a fresh join - so a delta against nil is zero and the first real hit is tagged `shift`.
 	if lives and hitsTaken and S.lastHitsTaken == nil then
 		S.lastHitsTaken = hitsTaken
 		S.lastOuts = tonumber(LocalPlayer:GetAttribute("MatchOuts"))
@@ -5225,10 +4397,8 @@ local function step()
 		S.lastOuts = outs
 		S.lifeDrops = (S.lifeDrops or 0) + 1
 		local wasHit = dTaken > 0
-		-- The game's own death event outranks the delta. `HitsTaken` does not move
-		-- on every heartbreak - a bot's ball took a life with `taken=+0` while
-		-- `how=Hit by=Bot kitty_girl` sat on the same row - so a row tagged
-		-- `shift` was hiding real hits as well as round shifts.
+		-- The game's own death event outranks the delta: a bot's ball took a life with `taken=+0`
+		-- while `how=Hit by=Bot` sat on the same row.
 		local howText = tostring(S.deathHow or "")
 		if not wasHit and S.hbAt and (now - S.hbAt) <= 0.5 and howText:lower():find("hit", 1, true) then
 			wasHit = true
@@ -5239,10 +4409,7 @@ local function step()
 		local dashReady = readyAt(character, "DashReadyAt")
 		local catchReady = readyAt(character, "CatchReadyAt")
 
-		-- What the tracker knew about the ball the game called nearest, asked at
-		-- the instant the life left. Without this the log can only say the ball
-		-- was 4.7 studs away in Live(); it cannot say whether the physical path
-		-- had an answer for it or had already been rejected.
+		-- What the tracker knew about the ball the game called nearest, asked when the life left.
 		local trackNote = "untracked"
 		local arcLast = S.arcLast and S.arcLast[S.nearPart]
 		if arcLast and (now - (arcLast.at or 0)) <= 0.15 then
@@ -5260,9 +4427,7 @@ local function step()
 				local vel = root.AssemblyLinearVelocity
 				local tti2, miss2, _, reason2, _, posNow2 =
 					pathThreat(rec, now, root.Position, Vector3.new(vel.X, 0, vel.Z), CONFIG.horizon, CATCH_RADIUS)
-				-- STALE marks a record the tracker stopped updating while the ball
-				-- was still reported near. Without it a `miss` from a 0.6 s old
-				-- sample reads exactly like a live one.
+				-- STALE marks a record the tracker stopped updating while the ball was still near.
 				local age2 = now - (rec.t or now)
 				trackNote = string.format(
 					"%s why=%s%s miss=%s tti=%s age=%.3f lag=%.3f d=%.1f",
@@ -5278,9 +4443,8 @@ local function step()
 			end
 		end
 
-		-- Resolve this life against the arrival ring. An arrival within 0.45 s of
-		-- the drop is the ball that took the life; the verdict on it says which
-		-- answer lost the race.
+		-- Resolve this life against the arrival ring: an arrival within 0.45 s is the ball that
+		-- took it, and the verdict says which answer lost the race.
 		local raceNote = "-"
 		local hit, hitAge = raceResolve(S.race, S.raceHead, S.raceMax, now, 0.45)
 		if hit then
@@ -5288,9 +4452,8 @@ local function step()
 			S.raceHit[hit.verdict] = (S.raceHit[hit.verdict] or 0) + 1
 		end
 
-		-- Which population took the life. The death row already answers "was there
-		-- an answer"; this answers "for whom", which is the whole question when the
-		-- same body handles both classes differently.
+		-- Which population took the life - the death row already answers whether there was an
+		-- answer.
 		local lostKind = classOf(S.contactBall or S.lastThreatBall)
 		tallyClass(lostKind, "loss")
 		S.lostClass = lostKind
@@ -5326,8 +4489,8 @@ local function step()
 			S.lastThrow and string.format("%.2f", now - S.lastThrow) or "never"
 		)
 
-		-- The ball the game says landed, and what this client knew about it. Only
-		-- when the Impact event is recent enough to belong to this drop.
+		-- The ball the game says landed, only when the Impact event is recent enough to be this
+		-- drop.
 		if S.impactInfo and S.lastImpact and (now - (S.lastImpact.at or 0)) <= 1.5 then
 			log[#log] = log[#log] .. " imp[" .. S.impactInfo .. "]"
 			if S.impactNear and S.impactNear ~= "" then
@@ -5335,8 +4498,7 @@ local function step()
 			end
 		end
 
-		-- The flight recorder's last second, verbatim. A death is a question
-		-- about what was visible, and this is the only copy of it.
+		-- The flight recorder's last second, verbatim: the only copy of what was visible.
 		local wide = S.pathWide
 		for i = math.max(1, #wide - 9), #wide do
 			log[#log + 1] = "  w " .. wide[i]
@@ -5349,10 +4511,8 @@ local function step()
 		S.lastLives = lives
 	end
 
-	-- Decision trace. A hit is only debuggable if the frames before it are still
-	-- readable, so the last two seconds of decisions are kept in a ring buffer.
-	-- The hint comes from `why`, and the ball identity is what makes a press map
-	-- back to the ball that actually landed.
+	-- Decision trace: the last two seconds in a ring, so a hit is debuggable from the frames
+	-- before it.
 	local trace = S.trace
 	trace[S.traceHead] = {
 		t = now,
@@ -5367,8 +4527,8 @@ local function step()
 	}
 	S.traceHead = (S.traceHead % S.traceMax) + 1
 
-	-- Silent aim plumbing. The shot itself is redirected on the Throw remote, so
-	-- all this does is keep the game's own target mirror and diagnostics current.
+	-- Silent aim plumbing: the shot is redirected on the remote, so this only keeps the
+	-- game's own target mirror and diagnostics current.
 	if CONFIG.silentAim then
 		local holding = LocalPlayer:GetAttribute("HasBall") == true
 		if holding or S.aimHeld then
@@ -5378,8 +4538,7 @@ local function step()
 		end
 	end
 
-	-- Optional camera lock, off by default. Silent aim needs none of this; it is
-	-- only here for the old hold-to-look behaviour.
+	-- Optional camera lock, off by default.
 	if CONFIG.autoAim and S.aimHeld then
 		local target = nearestEnemy(character, myTeam, root.Position)
 		local targetRoot = target and target:FindFirstChild("HumanoidRootPart")
@@ -5400,9 +4559,8 @@ local function step()
 		S.threatFrames = S.threatFrames + 1
 
 		if pressable then
-			-- A new ball means a new press budget. The decayed contact clock keeps
-			-- the same key after the segment disappears, so the budget is not reset
-			-- in the last frames of the same ball.
+			-- A new ball means a new press budget. The decayed clock keeps the same key after the
+			-- segment disappears, so the budget is not reset in the last frames of the same ball.
 			local key = best or S.contactBall
 			if key ~= S.pressBall then
 				S.pressBall = key
@@ -5414,23 +4572,17 @@ local function step()
 			local why = judgePress(character, root, effTti, effDir, now)
 			edge("why_" .. tostring(why))
 
-			-- The press schedule is an invariant over the judge window, not a
-			-- count: at the instant the ball arrives, the newest stamp must be no
-			-- older than CATCH_WINDOW and no newer than the 30 ms tolerance. Both
-			-- ends are compared on the predicted contact time, so a ball that
-			-- speeds up, bounces, or drops out of Live() cannot strand a stamp
-			-- outside the band - the schedule re-derives from the same contact
-			-- clock the judge will use.
+			-- The press schedule is an invariant over the judge window, not a count: at contact the
+			-- newest stamp must be no older than CATCH_WINDOW and no newer than the tolerance. Both
+			-- ends are compared on the predicted contact time, so a ball that bounces or drops out of
+			-- Live() cannot strand a stamp outside the band.
 			--
-			-- A ball with no stamp of its own is armed on the frame it becomes
-			-- catchable, whatever the refresh cadence says. The cadence exists to
-			-- stop the same ball being re-stamped pointlessly, not to make the
-			-- first ball after any other press wait out a counter.
+			-- A ball with no stamp of its own is armed on the frame it becomes catchable; the cadence
+			-- exists to stop re-stamping the same ball, not to make the next one wait.
 			local contactAt = effTti and (now + effTti) or nil
 			local cadence = math.max(0.10, math.min(CONFIG.pressInterval, window * 0.35))
-			-- A ball this schedule has never armed gets its first stamp whatever the
-			-- cadence says. Keyed on the ball, not on the stamp being nil, so a key
-			-- that flickers inside the same ball cannot turn every tick into a press.
+			-- Keyed on the ball, not on the stamp being nil, so a key that flickers inside the same
+			-- ball cannot turn every tick into a press.
 			local rearm = S.pressedBall ~= key
 			local canAttempt, scheduleWhy = scheduleDue(
 				contactAt,
@@ -5442,18 +4594,14 @@ local function step()
 				cadence
 			)
 
-			-- The server already answered this ball with a refusal. It arrives a
-			-- ping after the press, so the ball is normally still in the air when it
-			-- lands: stop pressing and become a body instead, because a refused
-			-- catch has no second press worth sending.
+			-- The server already refused this ball. It arrives a ping after the press, so the ball is
+			-- usually still in the air: stop pressing and become a body.
 			if S.refusedBall == key and (now - (S.refusedAt or -99)) < 0.35 then
 				S.pressWhy.veto = (S.pressWhy.veto or 0) + 1
 			elseif why == "facing" then
-				-- Outside the 120 deg catch cone. The server judges the angle on the
-				-- replicated root, so turning and pressing in the same frame presses
-				-- with a turn it has not seen yet. Turn now, press on the next tick,
-				-- and only give up the catch for the dash when contact is too close
-				-- for a turn to arrive.
+				-- Outside the catch cone. The server judges the angle on the replicated root, so turning
+				-- and pressing in the same frame presses with a turn it has not seen yet: turn now, press
+				-- next tick, and only give up the catch when contact is too close for a turn to arrive.
 				S.pressWhy[why] = (S.pressWhy[why] or 0) + 1
 				if effDir then
 					rotateTo(root, effDir)
@@ -5469,8 +4617,7 @@ local function step()
 				S.pressWhy[why] = (S.pressWhy[why] or 0) + 1
 				S.pressedBall = key
 
-				-- What the press was reasoning about. Recorded before the send so the
-				-- answer can be matched back to the numbers that produced it.
+				-- What the press was reasoning about, recorded before the send.
 				local metaBall = best or S.contactBall
 				local metaPos = metaBall and metaBall.real
 				S.pressMeta = {
@@ -5484,49 +4631,29 @@ local function step()
 				tallyClass(classOf(metaBall), "press")
 				press(character, now)
 			elseif scheduleWhy == "cadence" then
-				-- The stamp already in flight is inside the judge band. The cadence
-				-- only withheld a fresher one, so nothing is spent here: the fallback
-				-- below leaves the body alone while that stamp can still catch. This
-				-- used to dash, which burned a 2.2 s cooldown on balls the catch had
-				-- already answered.
+				-- The stamp already in flight is inside the band, so nothing is spent here - this used to
+				-- dash, burning a 2.2 s cooldown on balls the catch had already answered.
 				S.pressWhy.blocked = (S.pressWhy.blocked or 0) + 1
 			end
 		elseif reason == "holding ball" then
 			S.blocked = S.blocked + 1
 
-			-- Hands full is the only state where a catch is impossible by rule. The
-			-- throw used to fire on every inbound ball, and the 300 s audit showed
-			-- the cost: four of five lost lives were "Caught by <name>" - our own
-			-- throw taken by an enemy, which eliminates the thrower. A dash is free
-			-- of that risk, so the throw is now spent only when the dash cannot save
-			-- us: on cooldown, this is the last answer left.
+			-- Hands full is the only state where a catch is impossible by rule. The throw used to
+			-- fire on every inbound ball: the 300 s audit showed four of five lost lives were
+			-- "Caught by <name>" - our own throw taken by an enemy. So it is spent only when the
+			-- dash cannot save us. Not while sidelined: there the ball in hand is the re-entry pickup.
 			--
-			-- Not while sidelined. There the ball in hand is the re-entry pickup and
-			-- the throw is the player's - see CONFIG.autoReentry.
+			-- Two faults came from reading "can the dash save us" as a question about the hands:
 			--
-			-- Whether the dash can save us is a question about *this ball on this
-			-- tick*, and it was being answered as a question about the hands. Two
-			-- separate faults came out of reading it that way, and together they
-			-- turned the last-resort throw into a throw on every acquisition:
+			--   1. `dashReady` was trusted raw. The server publishes a far-future timestamp in states
+			--      where the action is not allowed, carrying a ball among them, so `dashReady > now`
+			--      read true for the whole hold and the dash looked unavailable from the pickup on.
+			--   2. `pressing` is armed by any ball predicted inside the CATCH window - a schedule
+			--      horizon, not an imminent hit - and the frame a pickup welds the ball to the hand is
+			--      one of those ticks.
 			--
-			--   1. `dashReady` was trusted raw. The catch path already bounds
-			--      CatchReadyAt to `now + 10` for exactly this reason - the server
-			--      publishes a far-future timestamp in states where the action is
-			--      not allowed at all, and carrying the ball is one of them. Read
-			--      unbounded, `dashReady > now` is true for the entire hold, so the
-			--      dash reads as unavailable from the frame of the pickup onward.
-			--   2. `pressing` is armed by any ball predicted to arrive inside the
-			--      *catch* window (0.35 s). That is the schedule's horizon, not a
-			--      statement that a hit is imminent, and in a live round it is true
-			--      most of the time. The frame a pickup welds the ball to the hand
-			--      is one of those ticks: the ball is at the palm, `decide()` has
-			--      not yet seen the game mark it held, and the answer is "a ball is
-			--      arriving".
-			--
-			-- The branch was written for one thing: the ball that is about to land
-			-- on this body, with no dash left to answer it. So it now tests that,
-			-- with the same clock and the same lead the dash itself uses, and it
-			-- refuses to name the ball already in the hand as the threat.
+			-- The branch now tests this ball on this tick, on the same clock and lead the dash uses,
+			-- and refuses to name the ball already in the hand as the threat.
 			local dashReady = readyAt(character, "DashReadyAt")
 			local dashBlocked = dashReady ~= nil and dashReady > now and dashReady < now + 10
 			local dashCadence = (now - S.lastDodge) < (GameConfig.DODGE_COOLDOWN or 2.2)
@@ -5560,11 +4687,9 @@ local function step()
 				end
 			end
 
-			-- Clearing the palm costs a round trip before CatchReadyAt will even be
-			-- consulted, so a ball already inside the dash lead cannot be answered
-			-- by a catch. Move instead of standing there holding it. effTti is the
-			-- contact clock, so the answer survives the frames where ThrowFX has
-			-- already dropped the ball and tti has gone nil.
+			-- Clearing the palm costs a round trip before CatchReadyAt is even consulted, so a ball
+			-- inside the dash lead cannot be answered by a catch - move instead. effTti survives the
+			-- frames where ThrowFX has dropped the ball and tti has gone nil.
 			local holdTti = tti or effTti
 			if holdTti and holdTti <= CONFIG.dodgeLead then
 				tallyClass(classOf(best or S.contactBall), "dash")
@@ -5580,20 +4705,13 @@ local function step()
 				S.holdNoTti = (S.holdNoTti or 0) + 1
 			end
 		elseif reason == "cooldown" then
-			-- The server refuses a catch for 0.6 s after one lands. Whether this ball
-			-- can still be caught is decided once, below, from the stamp and the
-			-- CatchReadyAt the server publishes - a dash spent here would be spent on
-			-- balls the previous press already catches, which is how the dash budget
-			-- ran out in the first place.
+			-- Whether this ball can still be caught is decided from the stamp and the published
+			-- CatchReadyAt; a dash spent here would be spent on balls the previous press already
+			-- catches, which is how the dash budget ran out.
 			--
-			-- This window is where every death in live play happened. A walk-speed
-			-- step was tried here and measured, because it is the only answer with no
-			-- cooldown of its own: 91 steps in 152 s, then 224 in 228 s, and the death
-			-- count went up rather than down (1 per 152 s before, 4 per 380 s after,
-			-- with a dash in that batch finishing 0.03 studs *behind* its own axis).
-			-- Stepping through the lockout moves the body without regard for where the
-			-- next ball is coming from, so it is not an answer - it is a second thing
-			-- to be hit by. Counted, not acted on.
+			-- This window is where every death in live play happened, and a walk-speed step here was
+			-- measured and made it worse: 91 steps in 152 s, then 224 in 228 s, and the death count
+			-- rose from 1 per 152 s to 4 per 380 s. Counted, not acted on.
 			if best ~= S.pressBall then
 				S.pressBall = best
 				S.unreachable = S.unreachable + 1
@@ -5612,18 +4730,13 @@ local function step()
 		end
 	end
 
-	-- The body is the answer whenever the catch cannot be. The test is the judge's
-	-- own: is the stamp for this ball, measured against the contact time it will be
-	-- judged at, still inside the window - and is CatchReadyAt already past by the
-	-- time it lands?
+	-- The body answers whenever the catch cannot, and the test is the judge's own: is the
+	-- stamp for this ball still inside the window at the contact time it will be judged, and
+	-- is CatchReadyAt already past?
 	--
-	-- Decided by the stamp, not by whether another press could be sent right now.
-	-- The old test asked `canPress`, which goes false the moment a previous catch
-	-- arms CatchReadyAt - so a ball that already had a valid stamp and would land
-	-- was treated as uncatchable and got a dash spent on it. That is where the dash
-	-- budget went: 20 catches and 24 dashes in a 300 s round, leaving nothing in
-	-- reserve for the balls that genuinely cannot be caught. Only the judge
-	-- refusing this ball, or CatchReadyAt outliving it, disqualifies a stamp.
+	-- Decided by the stamp, not by canPress: canPress goes false the moment a previous catch
+	-- arms CatchReadyAt, so a ball that already had a valid stamp was treated as uncatchable.
+	-- That is where the dash budget went - 20 catches and 24 dashes in a 300 s round.
 	local catchInFlight = false
 	local catchBall = best or S.contactBall
 	if effTti then
@@ -5640,17 +4753,13 @@ local function step()
 	-- The physical threat was read above, before the contact clock, so the press
 	-- schedule and the body lane are fed by the same answer. Nothing to re-read.
 
-	-- Per-ball veto -----------------------------------------------------------------
-	-- `catchInFlight` answers "did we press for the ball decide() picked". It does
-	-- not answer "is the ball that is actually arriving covered", and treating it
-	-- as if it did is the fault this block exists to remove: a press aimed at one
-	-- ball stood the body down for every other ball, including ricochets and balls
-	-- the game had stopped marking canHit. Those are refused by the catch judge by
-	-- construction, so the only answer they can ever have is the body, and it was
-	-- being withheld for them.
+	-- Per-ball veto. `catchInFlight` answers "did we press for the ball decide() picked", not
+	-- "is the arriving ball covered", and treating it as if it did stood the body down for
+	-- every other ball - ricochets and nocanhit balls the judge refuses by construction, whose
+	-- only possible answer is the body.
 	--
-	-- The veto is now stated over the arriving part: it stands only if the press
-	-- would be accepted for THIS ball at ITS contact time.
+	-- The veto now stands only if the press would be accepted for THIS ball at ITS contact
+	-- time.
 	local heldForThisBall = false
 	if phTti and (phPart or phState) then
 		local state = phState or stateOfPart[phPart]
@@ -5668,25 +4777,17 @@ local function step()
 	end
 
 	if not heldForThisBall then
-		-- The body answer reads the physical path, not Live(). A ricochet has no
-		-- segment that predicts a hit and no velocity history, and a ball already
-		-- resolved by the judge has left Live() entirely - both are invisible to
-		-- every other predictor on exactly the frames that decide the hit. The
-		-- part is never invisible.
+		-- The body answer reads the physical path, not Live(): a ricochet has no segment
+		-- predicting a hit, and a ball already resolved by the judge has left Live() entirely.
+		-- The part is never invisible.
 		--
-		-- Full horizon for the sidestep: the catch has already been ruled out, so
-		-- every extra tenth of a second is another 1.6 studs of lateral travel and
-		-- the only cost is walking. The arming lead itself is derived inside
-		-- `evade` from the distance the step owes, not passed in as a horizon -
-		-- passing the horizon armed the step a whole second before the ball.
+		-- Full horizon for the sidestep - the catch is ruled out, so every extra tenth is 1.6
+		-- studs of travel and the only cost is walking. The lead derives inside `evade` from the
+		-- distance owed; passing a horizon armed the step a whole second early.
 		--
-		-- One case gets a longer lead on purpose: a ball that lands before
-		-- CatchReadyAt re-arms. There the judge refuses every press, the dash is
-		-- usually still on cooldown from the catch that just landed, and the
-		-- sidestep is the only answer left - so it starts walking early instead
-		-- of waiting for its own short lead. That is the "lost a life right after
-		-- a catch" shape: measured at death with catchIn +0.15..+0.43 and
-		-- dashIn +1.3..+1.5, i.e. both actions unavailable and no step taken.
+		-- One case gets a longer lead on purpose: a ball landing before CatchReadyAt re-arms.
+		-- Judge refuses, dash is on cooldown, so the step starts early - the "lost a life right
+		-- after a catch" shape, measured at catchIn +0.15..+0.43 and dashIn +1.3..+1.5.
 		if phTti then
 			S.pathOpen = (S.pathOpen or 0) + 1
 			S.dashBall = phState
@@ -5696,11 +4797,9 @@ local function step()
 			if evaded then
 				S.pathJukes = (S.pathJukes or 0) + 1
 			end
-			-- The body answer's own ring. `evadeWhy` says what evade decided but not
-			-- whether the arriving ball was ever handed to it: a death at 5 studs
-			-- with a perfect 0.126 s `hit` answer and no action is either "evade was
-			-- asked and declined" or "this ball was never the one it was asked
-			-- about", and the two need different fixes.
+			-- The body answer's own ring: a death at 5 studs with a perfect hit answer and no action
+			-- is either "evade declined" or "this ball was never handed to it", and the two need
+			-- different fixes.
 			local bl = S.bodyLog
 			local bn = (S.bodyN or 0) + 1
 			S.bodyN = bn
@@ -5745,12 +4844,8 @@ local function step()
 		)
 	end
 
-	-- Return to the field. While eliminated, a ball in hand is the route back in.
-	-- That throw belongs to the player: it needs a chosen target and it has to
-	-- leave on a wind-up, not on the frame the pickup welds to the hand. This
-	-- block is therefore opt-in (CONFIG.autoReentry, off by default) and stays
-	-- out of the way otherwise - the handout filter above keeps the body still
-	-- until the teammate's pass actually arrives, so nothing else acts here.
+	-- Return to the field: while eliminated a ball in hand is the route back in, and that
+	-- throw is the player's - a chosen target, on a wind-up. Opt-in via CONFIG.autoReentry.
 	if out
 		and CONFIG.autoThrow
 		and CONFIG.autoReentry
@@ -5760,10 +4855,8 @@ local function step()
 		throwHeld(character, root, now, true)
 	end
 
-	-- Refusal tally. The server writes CatchNote as "why|stamp" whenever a catch is
-	-- denied, and that attribute is the ONLY refusal channel: CatchRefused is never
-	-- broadcast on FX, so the earlier event-based counter read zero forever. One
-	-- round gives an exact count here instead.
+	-- CatchNote is the only refusal channel - CatchRefused is never broadcast on FX, so the
+	-- event-based counter read zero forever.
 	local note = LocalPlayer:GetAttribute("CatchNote")
 	if type(note) == "string" and note ~= S.lastNote then
 		S.lastNote = note
@@ -5847,9 +4940,8 @@ S._pressNow = function()
 	end
 end
 
--- Ring-buffer read-out, oldest first. A hit is read backwards from here: which
--- reason was live, whether a press was already spent on that ball, and whether
--- the server had either gate closed at the time.
+-- Ring read-out, oldest first: which reason was live, whether a press was already spent
+-- on that ball, and whether either server gate was closed.
 S.traceDump = function()
 	local rows = {}
 	local head = S.traceHead
@@ -5881,14 +4973,9 @@ S._throwNow = function()
 	return throwHeld(character, root, Workspace:GetServerTimeNow())
 end
 
--- Test agent ------------------------------------------------------------------
---
--- Drives the character so a round can be measured without a human at the keys.
--- Movement goes through Humanoid:Move, which is client-owned and replicates the
--- same way stick input does: no synthetic key events, no teleports, no CFrame
--- warps. The agent strafes around the nearest enemy, reverses on a timer, jumps,
--- and throws whenever a ball is in hand, which is exactly the load the catch and
--- throw paths have to survive.
+-- Test agent: drives the character so a round can be measured without a human. Movement
+-- goes through Humanoid:Move, which replicates like stick input - no synthetic keys, no
+-- teleports, no CFrame warps.
 
 local agent = { running = false, until_ = 0 }
 
@@ -5996,9 +5083,7 @@ function S.agentStart(seconds)
 	return true
 end
 
--- What the physical track holds right now, and what the body answer reads off it.
--- Diagnostic: the tracker is the only input that survives a ball leaving Live(),
--- so when a death says "we never saw it" this is where the answer lives.
+-- What the physical track holds right now and what the body answer reads off it.
 S.pathDebug = function()
 	local character = LocalPlayer.Character
 	local root = character and character:FindFirstChild("HumanoidRootPart")
@@ -6217,12 +5302,8 @@ S.decideAs = function(live, out, now)
 	return decide(live, character, root, body, now or Workspace:GetServerTimeNow(), myTeam, nil, out == true)
 end
 
--- Synthetic fixtures. Each case pins a ball's world line relative to the player
--- and asserts whether the detector should treat it as an inbound hit.
--- Ghost check. The visible ball display is judged against the server's own
--- `HasBall`, not against our intentions: one ball drawn in the palm exactly when
--- the server says one is held. Both directions are measured, because the old
--- watchdog only ever watched one of them and reported zero while the other was
+-- Ghost check: the visible display judged against the server's own HasBall, both
+-- directions - the old watchdog only watched one and reported zero while the other was
 -- on screen.
 S.ghostReport = function()
 	local character = LocalPlayer.Character
@@ -6278,14 +5359,9 @@ S.ghostReport = function()
 	return out
 end
 
--- Press-schedule sweep. Pure: it drives `scheduleDue` with a contact clock and
--- the live judge window, sampling at the loop's own tick, and asks one question
--- per profile - is a stamp inside the judge band at the instant of contact?
---
--- The profiles are the ones that actually lose lives: a ball first seen late at
--- point blank, a ball first seen inside the old 0.22 s lead, and a second ball
--- arriving a frame after the first press. Each of those used to reach contact
--- with nothing armed, which left the dash as the only answer.
+-- Press-schedule sweep: one question per profile - is a stamp inside the judge band at
+-- the instant of contact? The profiles are the ones that lose lives: first seen at point
+-- blank, first seen inside the old 0.22 s lead, and a second ball a frame after a press.
 S.pressTest = function()
 	local character = LocalPlayer.Character
 	if not character then
@@ -6426,12 +5502,8 @@ S.catchTest = function()
 	return { ok = failures == 0, failures = failures, rows = rows }
 end
 
--- Physical-path sweep. Pure: it drives `pathThreat` over the trajectories that
--- decide a life - a head-on throw, a point-blank arrival, the first frame after
--- release, and the first frame after a bounce - plus the ones that must stay
--- silent. The ricochet cases are the reason this seam exists: the frame after a
--- bounce is the one frame where both a velocity estimate and a Live() segment are
--- wrong, and it is also the frame a point-blank hit is decided on.
+-- Physical-path sweep over the trajectories that decide a life - head-on, point-blank,
+-- the frame after release, the frame after a bounce - plus the ones that must stay silent.
 S.pathTest = function()
 	local rootPos = Vector3.new(0, 0, 0)
 	local rootVel = Vector3.new(0, 0, 0)
@@ -6646,11 +5718,8 @@ S.pathTest = function()
 		)
 	end
 
-	-- Arrival cases. A ball re-placed next to the body has one position and no
-	-- trajectory, which is exactly the shape that killed a life in the 240 s run:
-	-- `no_sample` on every tick while the ball crossed the reach radius. These
-	-- rows pin the rule that answers it, and the bounds that keep it from arming
-	-- on a ball the tracker merely lost.
+	-- Arrival cases: a ball re-placed next to the body has one position and no trajectory,
+	-- which is the shape that answered no_sample on every tick while crossing the reach radius.
 	local arrivalCases = {
 		{
 			-- Pooled at (0,-500,0) then re-placed 9 studs out: the hop is a
@@ -6774,10 +5843,8 @@ S.pathTest = function()
 		)
 	end
 
-	-- Part-selection cases. The measured failure is here: every ball in
-	-- DodgeBalls is anchored and CFrame-driven, so a tracker that skips anchored
-	-- parts tracks nothing while the balls fly past it. The rule is motion-based,
-	-- and these rows pin down what it accepts and what it must still refuse.
+	-- Part-selection cases. Every ball in DodgeBalls is anchored and CFrame-driven, so a
+	-- tracker that skips anchored parts tracks nothing while the balls fly past.
 	local function stubPart(parented, welded)
 		return {
 			Parent = parented and true or nil,
@@ -6815,10 +5882,8 @@ S.pathTest = function()
 		)
 	end
 
-	-- Sampling cases. These are the two shapes that made the tracker blind in a
-	-- live round: a ball replicated in hops (most ticks see the same position),
-	-- and a hop whose delta is compared against one tick instead of the true
-	-- interval. Both produced a nil path on every tick while balls flew past.
+	-- Sampling cases: a ball replicated in hops, and a hop whose delta was compared against
+	-- one tick instead of the true interval. Both produced a nil path on every tick.
 	local sampleCases = {
 		{
 			name = "path_first_sample",
@@ -7101,11 +6166,9 @@ S.raceTest = function()
 	return { ok = failures == 0, rows = rows, failures = failures }
 end
 
--- Segment-source cases. The part tracker cannot answer for any ball this game
--- throws - the part is pooled for the whole flight of every class - so the body
--- answer depends entirely on the segment source. These cases drive it with a
--- ball that has no part at all, which is exactly the live shape, and require the
--- same verdicts from the player-thrown and bot-thrown copy of the same geometry.
+-- Segment-source cases. The part tracker cannot answer for any ball this game throws, so
+-- these drive a ball with no part at all - the live shape - and require the same verdicts
+-- from the player-thrown and bot-thrown copy of the same geometry.
 S.segPathTest = function()
 	local character = LocalPlayer.Character
 	local root = character and character:FindFirstChild("HumanoidRootPart")
@@ -7170,12 +6233,9 @@ S.segPathTest = function()
 	run("segpath_attack_passing", "attack", Vector3.new(20, 0, 30), Vector3.new(0, 0, -120), false)
 	run("segpath_bot_passing", "bot", Vector3.new(20, 0, 30), Vector3.new(0, 0, -120), false)
 
-	-- The routing bug that kept the segment source silent for a whole session:
-	-- `covered` tested whether the part was in the tracker, and the pooled part
-	-- always is, so every ball was handed to a source that cannot see it. These
-	-- cases pin the test that replaces it. A record with no distinct second
-	-- position is a parked seat and must not count as carrying motion, however
-	-- recently it was touched.
+	-- The routing bug that kept the segment source silent: `covered` tested tracker
+	-- membership, and a pooled part is always a member, so every ball went to a source that
+	-- cannot see it. A record with no distinct second position is a parked seat.
 	local carryCases = {
 		{
 			name = "carry_parked_never_moved",
@@ -7223,21 +6283,15 @@ S.segPathTest = function()
 		)
 	end
 
-	-- The seam the reported bug actually lived at ---------------------------
+	-- The seam the reported bug lived at. Everything above drives pathThreat directly, which
+	-- proves the predictor understands a segment but not that physicalThreat ever asks it -
+	-- and that gate is where the failure was: a test that calls the predictor can never go
+	-- red on a routing bug in its caller.
 	--
-	-- Everything above drives pathThreat directly, which proves the predictor
-	-- understands a segment. It does not prove physicalThreat ever asks it, and
-	-- that gate is where the failure was: `covered` tested tracker membership,
-	-- the pooled part is always a member, so every ball was routed to a source
-	-- that cannot see it and the segment answered for nothing at all. A test
-	-- that calls the predictor can never go red on a routing bug in its caller.
-	--
-	-- So these drive physicalThreat with the live shape - a ball whose part is
-	-- parked in the tracker and whose only motion is on the segment - and
-	-- require the same answer from both populations. The last two cases are the
-	-- other direction: a ball the part does carry, and a ball with no segment at
-	-- all, must not be answered by this path, or the fix becomes a dodge at
-	-- everything.
+	-- So these drive physicalThreat with the live shape - part parked in the tracker, motion
+	-- on the segment - and require the same answer from both populations. The last two cases
+	-- are the other direction: a part that really carries the ball, and a ball with no
+	-- segment, must not be answered here or the fix becomes a dodge at everything.
 	local stubCharacter = {
 		GetAttribute = function()
 			return nil
@@ -7298,10 +6352,8 @@ S.segPathTest = function()
 		rows[#rows + 1] = string.format("%s %s %s", name, pass and "PASS" or "FAIL", detail)
 	end
 
-	-- Hermetic: with live balls in the tracker a fixture case could be answered
-	-- by somebody else's ball and pass or fail for the wrong reason. The tracker
-	-- is saved, emptied, exercised and restored - the whole block runs without
-	-- yielding, so no live tick can observe the empty state.
+	-- Hermetic: with live balls in the tracker a fixture could be answered by somebody
+	-- else's ball. The tracker is saved, emptied, exercised and restored, all without yielding.
 	local savedPath = {}
 	for part, rec in pairs(ballPath) do
 		savedPath[part] = rec
@@ -7514,11 +6566,9 @@ S.selftest = function()
 			state = make(Vector3.new(0, 0, 30), Vector3.new(0, 0, -120), { thrower = enemyThrower }),
 		},
 
-		-- The class split. The same geometry must produce the same decision whether
-		-- the game called the throw a bot throw or a player throw: the predictor is
-		-- class-blind by construction, and if that ever stops being true these two
-		-- cases are the ones that say so. They exist so a future change cannot make
-		-- one population easy and the other invisible without a test going red.
+		-- The class split: the same geometry must produce the same decision whether the game
+		-- called the throw a bot throw or a player throw. These two cases go red if that stops
+		-- being true.
 		{
 			name = "attack_class_inbound",
 			expect = true,
@@ -7583,10 +6633,9 @@ S.selftest = function()
 		)
 	end
 
-	-- Contact-audit classification. The audit's history was reading a 14.7 s old
-	-- stamp as a "late" press, which turns "no press was ever armed for this ball"
-	-- into "the schedule was a few frames behind" - two faults with different
-	-- repairs. Pinned at the boundary so a future edit cannot widen the window.
+	-- Contact-audit classification. The audit's history read a 14.7 s old stamp as a late
+	-- press, turning "never armed for this ball" into "a few frames behind". Pinned at the
+	-- boundary.
 	local verdictCases = {
 		{ name = "verdict_covered", covered = true, age = 0.10, expect = "covered" },
 		{ name = "verdict_late", covered = false, age = 0.30, expect = "late" },
@@ -7611,9 +6660,8 @@ S.selftest = function()
 		)
 	end
 
-	-- Class attribution. Every tally in this file is keyed on classOf, so a wrong
-	-- answer here silently moves a population's numbers into another population's
-	-- row - the exact failure the tally exists to detect. Pinned directly.
+	-- Class attribution. Every tally is keyed on classOf, so a wrong answer here silently
+	-- moves one population's numbers into another's row.
 	local classCases = {
 		{ name = "class_attack", state = { kind = "attack", botThrow = false }, expect = "attack" },
 		{ name = "class_bot", state = { kind = "bot", botThrow = true }, expect = "bot" },
@@ -7639,10 +6687,8 @@ S.selftest = function()
 		)
 	end
 
-	-- Body-path cases. The catch judge refuses a bounced or nocanhit ball; the hit
-	-- test does not. Each must stay invisible to the catch decision and visible to
-	-- the body decision, and the body decision reads the physical path, so the
-	-- sweep drives that predicate directly.
+	-- Body-path cases: the catch judge refuses a bounced or nocanhit ball, the hit test does
+	-- not, so each must stay invisible to the catch decision and visible to the body one.
 	local path = S.pathTest()
 	if path and path.rows then
 		for _, row in ipairs(path.rows) do
@@ -7705,10 +6751,8 @@ S.selftest = function()
 		failures = failures + (race.failures or 0)
 	end
 
-	-- Configuration types. The body answer compares against these numbers on every
-	-- tick, so a string here is not a cosmetic fault: the comparison throws, the
-	-- tick is lost, and a ball that was seen reads as a ball that was never seen.
-	-- One row per key, so a report names the exact one that went bad.
+	-- Configuration types. A string here throws in a hot path and a ball that was seen reads
+	-- as a ball that was never seen. One row per key, so a report names the exact one.
 	for _, key in ipairs(NUMERIC_CONFIG) do
 		local kind = type(CONFIG[key])
 		local pass = kind == "number"
@@ -7802,14 +6846,10 @@ connection = UserInputService.InputEnded:Connect(function(input)
 end)
 table.insert(connections, connection)
 
--- The Stance ack is an acceptance, not a landing. Measured over 7 acks: the
--- pressed ball's closest approach was 1.83-3.34 studs and HasBall flipped
--- 0.08-0.41 s LATER - the ack arrives about 0.11 s before contact, which is the
--- draw lag plus the round trip. `catches` counts acks because that is the only
--- server-authored event there is, but what the player sees is the ball in the
--- palm, so a landing gets its own count: HasBall rising inside the window an ack
--- leaves open. A press that is accepted and does not land shows as acks rising
--- while lands does not.
+-- The Stance ack is an acceptance, not a landing: measured over 7 acks, the pressed
+-- ball's closest approach was 1.83-3.34 studs and HasBall flipped 0.08-0.41 s LATER.
+-- `catches` counts acks because that is the only server-authored event; a landing is
+-- HasBall rising inside the window an ack leaves open.
 connection = LocalPlayer:GetAttributeChangedSignal("HasBall"):Connect(function()
 	if LocalPlayer:GetAttribute("HasBall") ~= true then
 		return
@@ -7851,11 +6891,9 @@ local function isMyModel(model)
 	return typeof(model) == "Instance" and model == LocalPlayer.Character
 end
 
--- The server answers every catch press, and that answer is the only
--- authoritative word on whether a press could count. Catch arms CatchReadyAt
--- exactly the same as CatchRefused does, so the answer decides whether the next
--- 0.6 s is live. Stamps come back with millisecond rounding on the broadcast, so
--- the nearest pending press inside the refusal horizon is the match.
+-- The server answers every catch press. Catch arms CatchReadyAt exactly as CatchRefused
+-- does, so the answer decides whether the next 0.6 s is live. Stamps come back with
+-- millisecond rounding, so the nearest pending press inside the horizon is the match.
 local function matchPress(stamp)
 	if type(stamp) ~= "number" then
 		return nil
@@ -7928,14 +6966,8 @@ connection = FX.OnClientEvent:Connect(function(kind, payload)
 				pos = payload.pos,
 			}
 
-			-- What the client knew about the ball that landed, captured at the
-			-- instant the game says it landed. Until this existed, every hit row
-			-- could only describe whichever ball the tracker thought was nearest,
-			-- which is not the same question - the last recorded hit had a
-			-- `nocanhit,world` ball sitting 3.3 studs away and read `ball=nil`.
-			-- The ball's own entry is found by id and its flight position is read
-			-- off the segment, because in flight the part itself is parked in the
-			-- pool far from the play.
+			-- What the client knew about the ball that landed, captured when the game says it landed.
+			-- Found by id and read off the segment: in flight the part itself is parked in the pool.
 			local function segPos(st)
 				if not (st.seg and typeof(st.seg.p0) == "Vector3") then
 					return nil
@@ -7994,11 +7026,9 @@ connection = FX.OnClientEvent:Connect(function(kind, payload)
 			table.sort(near)
 			S.impactNear = table.concat(near, " | ")
 
-			-- The game's own impact point against this body, with no predictor in
-			-- the middle. Every radius in this file is a guess about where the
-			-- server draws the hit sphere; this is the measurement that replaces
-			-- the guess. `payload.pos` is server-authoritative and it arrives
-			-- with the impact, while the body is still standing where it stood.
+			-- The game's own impact point against this body, with no predictor in the middle. Every
+			-- radius in this file is a guess about where the server draws the hit sphere; this is the
+			-- measurement that replaces it.
 			if rootPos and typeof(payload.pos) == "Vector3" then
 				local d = (payload.pos - rootPos).Magnitude
 				local dx = payload.pos.X - rootPos.X
@@ -8085,11 +7115,8 @@ local function teardown()
 		humanoid.AutoRotate = true
 	end
 
-	-- Palm display. Every ball this script hid for a throw is put back: the
-	-- module's own hide is undone and the client-only transparency is cleared, so
-	-- an unload cannot leave an invisible ball welded to a hand. The table is
-	-- weakly keyed, so a ball the game already removed has taken its entry with
-	-- it and cannot be written to here.
+	-- Palm display: every ball this script hid for a throw is put back, so an unload cannot
+	-- leave an invisible ball welded to a hand.
 	for part in pairs(palmHidden) do
 		pcall(ThrowFX.ShowPart, part)
 		pcall(function()
@@ -8105,8 +7132,8 @@ local function teardown()
 		label = nil
 	end
 
-	-- Panel last: the refresh loop above reads Fluent, so clearing it and
-	-- destroying the library in the same breath stops the timer with the window.
+	-- Panel last: the refresh loop reads Fluent, so clearing it and destroying the library
+	-- together stops the timer with the window.
 	if Fluent then
 		pcall(function()
 			Fluent:Destroy()
