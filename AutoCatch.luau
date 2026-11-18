@@ -1,5 +1,8 @@
 -- AutoCatch - auto catch, dodge, sidestep and auto-throw for Prison Dodgeball.
 --
+-- Still new. If it misbehaves, comment on the ScriptBlox page with what you were
+-- doing and what happened; reports come back here and get fixed.
+--
 -- Presses only while the game's own predictor says a ball will intersect the player's
 -- capsule within CONFIG.pressLead. Timing comes from ThrowFX.catching(), which accepts a
 -- press whose age at contact is inside [-0.03, +0.36], so the schedule opens early and
